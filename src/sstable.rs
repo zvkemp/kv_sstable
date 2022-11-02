@@ -67,7 +67,7 @@ impl SSTable {
     }
 
     pub(crate) async fn decommission(self) -> Result<(), Error> {
-        let inner = Arc::try_unwrap(self.inner).unwrap();
+        let inner = Arc::try_unwrap(self.inner).expect("memory leak!");
         inner.decommission().await
     }
 
@@ -513,7 +513,14 @@ impl SSTable {
         }
 
         let idx_read = self.inner.summary.index.read().await;
-        let (duration, position, len) = idx_read.as_ref().unwrap().get(key).unwrap();
+        let (duration, position, len) =
+            idx_read
+                .as_ref()
+                .unwrap()
+                .get(key)
+                .ok_or_else(|| Error::DataNotFound {
+                    key: key.to_owned(),
+                })?;
 
         let now = Instant::now();
         // let mut sstable = tokio::fs::File::open(&self.path.with_extension("sstable"))

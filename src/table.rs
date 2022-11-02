@@ -108,10 +108,7 @@ impl Table {
         Ok((sender, handle))
     }
 
-    pub(crate) async fn new(
-        path: impl AsRef<Path>,
-        memtable_size_limit: usize,
-    ) -> Result<Self, Error> {
+    pub async fn new(path: impl AsRef<Path>, memtable_size_limit: usize) -> Result<Self, Error> {
         tokio::fs::create_dir_all(&path).await.unwrap();
 
         let mut entries = tokio::fs::read_dir(&path).await.unwrap();
@@ -402,6 +399,7 @@ impl Table {
     ) -> Result<(), Error> {
         // FIXME: check if reply_to is opened, or if we timed out client-side
         let res = self.live_memtable.insert(key, timestamp, data).await;
+        // println!("sending reply");
         let _ = reply_to.send(res);
 
         if self.should_flush() {

@@ -5,6 +5,7 @@ pub enum Error {
     Other { description: String },
     Closed,
     NewerDataAlreadyHere,
+    // FIXME: exclude key here?
     DataNotFound { key: String },
     Io { source: io::Error },
     OkShutdown,
