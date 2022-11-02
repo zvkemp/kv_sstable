@@ -313,7 +313,7 @@ impl SSTable {
 
     pub async fn from_file(path: &Path) -> Self {
         let summary_path = path.with_extension("summary");
-        let summary_file = tokio::fs::read(dbg!(&summary_path)).await.unwrap();
+        let summary_file = tokio::fs::read(&summary_path).await.unwrap();
         let summary: Summary = bincode::deserialize(&summary_file).unwrap();
 
         let uuid = summary_path
@@ -435,7 +435,6 @@ impl MemTable {
         // write all data in order
         for key in keys {
             let (ts, bytes) = self.data.get(&key).unwrap();
-            println!("WRITING {key}");
             SSTable::write_key_and_value(&key, ts, bytes, &mut file, &mut index_file, &mut offset)
                 .await
                 .unwrap();
@@ -762,7 +761,7 @@ impl CompactionIndexInterleaver {
             if row.key == tail.1.key {
                 true
             } else {
-                println!(">>>> DROPPING DUPLICATE {row:?}");
+                tracing::debug!(">>>> DROPPING DUPLICATE {row:?}");
                 false
             }
         });
@@ -825,7 +824,6 @@ impl IndexRows {
                         match result {
                             Poll::Ready(Ok(slice)) => {
                                 let len = slice.len();
-                                dbg!(("extending", &len));
                                 this.internal_buf.extend_from_slice(slice);
                                 this.reader.as_mut().consume(len);
 
@@ -869,15 +867,10 @@ fn parse_index_row(bytes: &[u8]) -> Result<(IndexRow, usize), std::io::Error> {
     let mut start = [0; 8];
     let mut len = [0; 8];
 
-    println!("read key");
     std::io::Read::read_exact(&mut reader, &mut key)?;
-    println!("read secs");
     std::io::Read::read_exact(&mut reader, &mut secs)?;
-    println!("read nanos");
     std::io::Read::read_exact(&mut reader, &mut nanos)?;
-    println!("read start");
     std::io::Read::read_exact(&mut reader, &mut start)?;
-    println!("read len");
     std::io::Read::read_exact(&mut reader, &mut len)?;
 
     Ok((

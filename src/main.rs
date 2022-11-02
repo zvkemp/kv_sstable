@@ -72,7 +72,13 @@ async fn main() {
 
     let (table_2_sender, table_2_handle) = table_2.spawn().unwrap();
 
-    table_2_sender.send(Event::Compact).await.unwrap();
+    let compaction_sender = table_2_sender.clone();
+    tokio::spawn(async move {
+        loop {
+            compaction_sender.send(Event::Compact).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
 
     for i in 0..limit {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -116,7 +122,7 @@ async fn main() {
         });
     }
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_secs(300)).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     table_2_sender.send(Event::Shutdown).await.unwrap();

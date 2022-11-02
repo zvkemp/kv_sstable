@@ -276,8 +276,12 @@ impl Table {
         }
 
         if self.compaction_task.is_some() {
-            tracing::error!("Compaction in progress, can't start another one");
-            return Ok(());
+            if self.compaction_task.as_ref().unwrap().is_finished() {
+                self.compaction_task.take().unwrap().await.unwrap().unwrap();
+            } else {
+                tracing::error!("Compaction in progress, can't start another one");
+                return Ok(());
+            }
         }
 
         let sender = self.sender.clone().unwrap();
