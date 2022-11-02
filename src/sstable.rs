@@ -398,6 +398,7 @@ pub fn rand_guid(n: usize) -> String {
 pub struct Summary {
     first_key: String,
     last_key: String,
+    key_count: usize,
     timestamp: Duration,
     path: PathBuf,
     #[deprecated = "find a better way to interact and cache indexes"]
@@ -431,6 +432,7 @@ impl MemTable {
 
         let first_key = keys.first().cloned().unwrap();
         let last_key = keys.last().cloned().unwrap();
+        let key_count = keys.len();
 
         // write all data in order
         for key in keys {
@@ -457,6 +459,7 @@ impl MemTable {
         let summary = Summary {
             first_key,
             last_key,
+            key_count,
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
             path: pathbuf.clone(),
             index: RwLock::new(None),
@@ -564,6 +567,8 @@ impl SSTable {
             index_iterators.push(stream);
         }
 
+        let mut original_key_count: usize = tables.iter().map(|x| x.inner.summary.key_count).sum();
+
         let mut interleaver = CompactionIndexInterleaver::new_from_streams(index_iterators);
 
         let mut sstable_path = new_path.with_extension("writing_sstable");
@@ -579,6 +584,7 @@ impl SSTable {
         let mut sstable_file = options.open(&sstable_path).await.unwrap();
         let mut index_file = options.open(&new_index_path).await.unwrap();
         let mut offset = 0;
+        let mut key_count = 0;
         while let Some((table_index, row)) = interleaver.next_row().await {
             tracing::debug!("Compaction row: {row:?}");
 
@@ -601,6 +607,8 @@ impl SSTable {
             )
             .await
             .unwrap();
+
+            key_count += 1;
         }
 
         index_file.flush().await.unwrap();
@@ -612,6 +620,7 @@ impl SSTable {
         let summary = Summary {
             first_key: first_key.unwrap(),
             last_key: key,
+            key_count,
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
             path: new_path.with_extension(""),
             index: RwLock::new(None),
@@ -633,6 +642,10 @@ impl SSTable {
             .await
             .unwrap();
 
+        tracing::warn!(
+            "compaction done; key_count delta is {original_key_count} - {key_count} = {}",
+            original_key_count - key_count
+        );
         Ok(SSTable::from_file(new_path.as_path()).await)
     }
 }

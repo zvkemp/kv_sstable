@@ -21,7 +21,7 @@ async fn main() {
         std::process::exit(1);
     }));
 
-    let mb = 8;
+    let mb = 32;
 
     tracing::info!("spawning table 1");
     let table_1 = Table::new("/Users/zach/data/table_1_test", mb * 1024 * 1024)
@@ -103,7 +103,7 @@ async fn main() {
                 let data = format!("this is the data for {rand_id}")
                     .as_bytes()
                     .to_vec();
-                let multiplied = data.iter().cycle().take(64 * 1024);
+                let multiplied = data.iter().cycle().take(16 * 1024);
                 let bytes: Bytes = multiplied.copied().collect();
                 sender
                     .send(Event::Put {
