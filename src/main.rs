@@ -7,7 +7,6 @@ use table::{Event, Table};
 use tokio::sync::oneshot;
 
 pub mod error;
-pub mod index;
 pub mod sstable;
 pub mod table;
 

@@ -25,7 +25,7 @@ pub struct Table {
     path: PathBuf,
     live_memtable: MemTable,
     previous_memtable: Option<Arc<MemTable>>,
-    sstables: Vec<SSTable>,
+    sstables: GenerationalSSTables,
     memtable_size_limit: usize,
     sender: Option<Sender<Event>>,
     flush_semaphore: Arc<Semaphore>,
@@ -136,16 +136,20 @@ impl Table {
 
         sstables.sort_by(|a, b| a.uuid().cmp(&b.uuid()));
 
-        // FIXME: why does this work?
-        for sstable in sstables.iter() {
+        let mut generational_sstables = GenerationalSSTables::default();
+
+        // partition the sstables into their generations.
+        for sstable in sstables {
             println!("{}", sstable.uuid());
+
+            generational_sstables.push(sstable);
         }
 
         Ok(Table {
             path: path.as_ref().to_owned(),
             live_memtable: MemTable::new(path.as_ref()).await?,
             previous_memtable: None,
-            sstables,
+            sstables: generational_sstables,
             memtable_size_limit,
             sender: None,
             flush_semaphore: Arc::new(Semaphore::new(1)),
@@ -231,11 +235,7 @@ impl Table {
 
             Some(Event::MemTableFlushed(inner_res)) => match inner_res {
                 Ok(sstable) => {
-                    info!(
-                        "MemTableFlushed; sstables=[{}] new_summary={:?}",
-                        self.sstables.len() + 1,
-                        sstable.uuid()
-                    );
+                    info!("MemTableFlushed; new_summary={}", sstable.uuid());
                     self.sstables.push(sstable);
                     self.previous_memtable = None;
                     Ok(())
@@ -285,7 +285,12 @@ impl Table {
         }
 
         let sender = self.sender.clone().unwrap();
-        let to_compact = self.sstables.iter().map(|x| x._clone()).collect::<Vec<_>>();
+        let to_compact = self
+            .sstables
+            .get(0)
+            .iter()
+            .map(|x| x._clone())
+            .collect::<Vec<_>>();
 
         let handle = tokio::spawn(async move {
             let now = Instant::now();
@@ -346,18 +351,7 @@ impl Table {
     }
 
     async fn find_in_sstables(&mut self, key: &str) -> Result<Bytes, Error> {
-        fixme("this isn't quite correct - need to find all sstables where the key is in range, then compare the results");
-        for sstable in self.sstables.iter_mut().rev() {
-            match sstable.get(key).await {
-                Ok(bytes) => {
-                    return Ok(bytes);
-                }
-                Err(Error::KeyNotInRange) | Err(Error::DataNotFound { .. }) => {}
-                Err(e) => Err(e)?,
-            }
-        }
-        // FIXME: at this point should we detach to a task?
-        Err(Error::DataNotFound { key: key.into() })
+        self.sstables.find(key).await
     }
 
     async fn handle_put(
@@ -392,13 +386,13 @@ impl Table {
         new_sstable: SSTable,
         old_sstables: Vec<SSTable>,
     ) -> Result<(), Error> {
-        self.sstables.insert(old_sstables.len(), new_sstable);
+        self.sstables.push(new_sstable);
 
         for old_sstable in old_sstables {
-            let removed = self.sstables.remove(0);
+            let removed = self.sstables.pop_front(old_sstable.generation());
 
             if !removed.ptr_eq(&old_sstable) {
-                panic!("hmm");
+                panic!("hmm - something didn't line up");
             }
 
             drop(removed);
@@ -411,6 +405,54 @@ impl Table {
 
     // pub fn get(&self)
 }
+
+// Just a vec of vecs, sstables sorted into their generation ids. Newer generations are lower.
+#[derive(Default)]
+struct GenerationalSSTables {
+    inner: Vec<Vec<SSTable>>,
+}
+
+impl GenerationalSSTables {
+    fn push(&mut self, sstable: SSTable) {
+        while self.inner.len() < sstable.generation() + 1 {
+            self.inner.push(vec![]);
+        }
+
+        self.inner
+            .get_mut(sstable.generation())
+            .expect("while loop should have pushed a vec here")
+            .push(sstable);
+    }
+
+    fn get(&self, arg: usize) -> &[SSTable] {
+        self.inner.get(arg).map(|g| g.as_slice()).unwrap_or(&[])
+    }
+
+    fn pop_front(&mut self, generation: usize) -> SSTable {
+        self.inner
+            .get_mut(generation)
+            .expect("FIXME: no unwrap")
+            .remove(0)
+    }
+
+    async fn find(&mut self, key: &str) -> Result<Bytes, Error> {
+        fixme("this isn't quite correct - need to find all sstables where the key is in range, then compare the results");
+        for generation in self.inner.iter_mut() {
+            for sstable in generation.iter_mut().rev() {
+                match sstable.get(key).await {
+                    Ok(bytes) => {
+                        return Ok(bytes);
+                    }
+                    Err(Error::KeyNotInRange) | Err(Error::DataNotFound { .. }) => {}
+                    Err(e) => Err(e)?,
+                }
+            }
+        }
+        // FIXME: at this point should we detach to a task?
+        Err(Error::DataNotFound { key: key.into() })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Table;
