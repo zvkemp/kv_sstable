@@ -13,7 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 tokio = { version = "*", features = ["full", "io-util"] }
 tokio-stream = "*"
-bytes = "*"
+bytes = "^1.2.1"
 uuid = { version = "*", features = ["v4", "v7"] }
 rand = { version = "0.8" }
 serde = { version = "*", features = ["derive"] }

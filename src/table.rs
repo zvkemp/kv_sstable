@@ -174,15 +174,12 @@ impl Table {
             self.flush_live_memtable(false).await?;
         }
 
-        #[cfg(fixme)]
-        if self.sstables.len() > 4 {
-            self.sender
-                .as_ref()
-                .unwrap()
-                .send(Event::Compact(0))
-                .await
-                .unwrap()
-        }
+        self.sender
+            .as_ref()
+            .unwrap()
+            .send(Event::Compact { threshold: 5 })
+            .await
+            .unwrap();
 
         Ok(())
     }
