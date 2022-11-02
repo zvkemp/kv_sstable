@@ -32,6 +32,7 @@ pub struct Table {
     is_shutting_down: bool,
     flush_handle: Option<JoinHandle<Result<(), Error>>>,
     compaction_task: Option<JoinHandle<Result<(), Error>>>,
+    compaction_count: usize,
 }
 
 // Table should be able to provide access to data in the following order:
@@ -58,7 +59,17 @@ pub enum Event {
     Tick, //
     Shutdown,
     ShutdownFinished,
-    Compact,
+    // compact a specific generation
+    CompactGen {
+        generation: usize,
+        threshold: usize,
+    },
+    // compact the newest generation that meets the threshold.
+    // NOTE: compacting older generations is unlikely to have a great effect in reclaimed space,
+    // as most updates should be in the newer gens.
+    Compact {
+        threshold: usize,
+    },
     CompactionFinished(SSTable, Vec<SSTable>),
 }
 
@@ -156,6 +167,7 @@ impl Table {
             flush_handle: None,
             is_shutting_down: false,
             compaction_task: None,
+            compaction_count: 0,
         })
     }
 
@@ -170,7 +182,7 @@ impl Table {
             self.sender
                 .as_ref()
                 .unwrap()
-                .send(Event::Compact)
+                .send(Event::Compact(0))
                 .await
                 .unwrap()
         }
@@ -246,7 +258,11 @@ impl Table {
                 self.tick().await?;
                 Ok(())
             }
-            Some(Event::Compact) => self.compact().await,
+            Some(Event::CompactGen {
+                generation,
+                threshold,
+            }) => self.compact_gen(generation, threshold).await,
+            Some(Event::Compact { threshold }) => self.compact(threshold).await,
             Some(Event::CompactionFinished(new_sstable, old_sstables)) => {
                 tracing::info!("Compation finished; new_sstable = {new_sstable:?}");
                 self.finalize_compaction(new_sstable, old_sstables).await
@@ -269,12 +285,30 @@ impl Table {
         }
     }
 
-    async fn compact(&mut self) -> Result<(), Error> {
+    async fn compact(&mut self, threshold: usize) -> Result<(), Error> {
+        if let Some(candidate) = self
+            .sstables
+            .inner
+            .iter()
+            .enumerate()
+            .find(|(_, v)| v.len() >= threshold)
+            .map(|(i, _)| i)
+        {
+            self.compact_gen(candidate, threshold).await
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn compact_gen(&mut self, gen: usize, threshold: usize) -> Result<(), Error> {
         if self.is_shutting_down {
             tracing::error!("can't compact during shutdown :(");
             return Ok(());
         }
 
+        self.compaction_count += 1;
+
+        fixme("this may be contentious between generations");
         if self.compaction_task.is_some() {
             if self.compaction_task.as_ref().unwrap().is_finished() {
                 self.compaction_task.take().unwrap().await.unwrap().unwrap();
@@ -284,14 +318,19 @@ impl Table {
             }
         }
 
+        if self.sstables.length_of(gen) < threshold {
+            return Ok(());
+        }
+
         let sender = self.sender.clone().unwrap();
         let to_compact = self
             .sstables
-            .get(0)
+            .get(gen)
             .iter()
             .map(|x| x._clone())
             .collect::<Vec<_>>();
 
+        tracing::warn!("Spawning compaction for {:?} generation {gen}", self.path);
         let handle = tokio::spawn(async move {
             let now = Instant::now();
             match SSTable::compact(&to_compact).await {
@@ -436,7 +475,9 @@ impl GenerationalSSTables {
     }
 
     async fn find(&mut self, key: &str) -> Result<Bytes, Error> {
-        fixme("this isn't quite correct - need to find all sstables where the key is in range, then compare the results");
+        fixme("this isn't quite correct - need to find all sstables where the key is in range, then compare the results by timestamp");
+        // what assumptions can we make about generational residency?
+        fixme("track key ranges (max/min) on the generations");
         for generation in self.inner.iter_mut() {
             for sstable in generation.iter_mut().rev() {
                 match sstable.get(key).await {
@@ -450,6 +491,15 @@ impl GenerationalSSTables {
         }
         // FIXME: at this point should we detach to a task?
         Err(Error::DataNotFound { key: key.into() })
+    }
+
+    fn length_of(&self, gen: usize) -> usize {
+        self.inner.get(gen).map(|x| x.len()).unwrap_or_default()
+    }
+
+    // generation count
+    fn generation_count(&self) -> usize {
+        self.inner.len()
     }
 }
 

@@ -74,8 +74,11 @@ async fn main() {
     let compaction_sender = table_2_sender.clone();
     tokio::spawn(async move {
         loop {
-            compaction_sender.send(Event::Compact).await.unwrap();
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            compaction_sender
+                .send(Event::Compact { threshold: 5 })
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
 
