@@ -1,14 +1,10 @@
-use std::{
-    collections::HashMap,
-    io::SeekFrom,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, time::Duration};
 
-use bytes::{buf::Reader, Buf, Bytes, BytesMut};
-use tokio::{
-    fs::OpenOptions,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-};
+use bytes::Bytes;
+use error::Error;
+use sstable::rand_bytes;
+use table::{Event, Table};
+use tokio::sync::oneshot;
 
 pub mod error;
 pub mod index;
@@ -17,103 +13,120 @@ pub mod table;
 
 #[tokio::main]
 async fn main() {
-    let mut datafile = Datafile::new("/Users/zach/append_only_1.data").await;
+    fixme("make this an integration test");
+    tracing_subscriber::fmt::init();
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_panic(info);
+        std::process::exit(1);
+    }));
 
-    let d1 = Data {
-        key: "data1".into(),
-        value: Bytes::from(vec![0, 1, 2, 3, 4, 5]),
-        timestamp: 0,
-    };
-    let d2 = Data {
-        key: "data2".into(),
-        value: Bytes::from(vec![0, 1, 2, 3, 4, 5, 6, 7]),
-        timestamp: 0,
-    };
+    let mb = 8;
 
-    datafile.store(d1.clone()).await.unwrap();
-    datafile.store(d2.clone()).await.unwrap();
-    let d2g = datafile.get("data2".into()).await.unwrap();
-    let d1g = datafile.get("data1".into()).await.unwrap();
+    tracing::info!("spawning table 1");
+    let table_1 = Table::new("/Users/zach/data/table_1_test", mb * 1024 * 1024)
+        .await
+        .unwrap();
 
-    assert_eq!(d1, d1g);
-    assert_eq!(d2, d2g);
-}
+    let (table_1_sender, table_1_handle) = table_1.spawn().unwrap();
 
-#[derive(Debug)]
-struct Datafile {
-    path: PathBuf,
-    file: tokio::fs::File,
-    len: usize,
-    keys: HashMap<String, (usize, usize)>,
-}
+    let mut generated_data = HashMap::new();
 
-// build it around time series data for ease of management.
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct Data {
-    key: String,
-    value: Bytes,
-    timestamp: usize,
-}
+    let limit = 1000;
 
-type Result<T> = std::result::Result<T, String>;
-
-// track number of bytes in a file.
-// track number of bytes appended to the file; each key would point to current offset.
-impl Datafile {
-    async fn new(path: impl AsRef<Path>) -> Datafile {
-        let file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(path.as_ref())
+    for i in 0..limit {
+        tracing::debug!("put {i:0>6}");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // let data = rand_bytes(24);
+        let data = format!("this is the data for {i}").as_bytes().to_vec();
+        let multiplied = data.iter().cycle().take(64 * 1024);
+        let bytes: Bytes = multiplied.copied().collect();
+        generated_data.insert(i, bytes.clone());
+        table_1_sender
+            .send(Event::Put {
+                data: bytes,
+                timestamp: sstable::timestamp(),
+                key: format!("key/for/{i:0>6}"),
+                reply_to: tx,
+            })
             .await
             .unwrap();
 
-        let len = file.metadata().await.unwrap().len() as usize;
-        Datafile {
-            path: path.as_ref().to_owned(),
-            file,
-            len,
-            keys: Default::default(),
+        rx.await.unwrap().unwrap();
+    }
+
+    table_1_sender.send(Event::Shutdown).await.unwrap();
+    match table_1_handle.await.unwrap() {
+        Ok(_) => {}
+        Err(Error::OkShutdown) => {}
+        Err(e) => {
+            tracing::error!("{e:?}");
         }
     }
 
-    async fn store(&mut self, data: Data) -> Result<()> {
-        // fixme; what sort of buffers?
-        self.file.write_all(data.value.as_ref()).await.unwrap();
-        let offset = self.len;
-        let len = data.value.len();
-        self.file.flush().await.unwrap();
-        self.track_key(data.key, offset, len).await;
-        self.len += len;
-        Ok(())
+    // tokio::time::sleep(Duration::from_secs(100)).await;
+
+    let table_2 = Table::new("/Users/zach/data/table_1_test", mb * 1024 * 1024)
+        .await
+        .unwrap();
+
+    let (table_2_sender, table_2_handle) = table_2.spawn().unwrap();
+
+    table_2_sender.send(Event::Compact).await.unwrap();
+
+    for i in 0..limit {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let key = format!("key/for/{i:0>6}");
+        tracing::info!("GET {key}");
+        table_2_sender
+            .send(Event::Get { key, reply_to: tx })
+            .await
+            .unwrap();
+
+        let res = rx.await.unwrap().unwrap();
+        assert_eq!(res, generated_data.get(&i).unwrap(), "error on {i}");
     }
 
-    async fn track_key(&mut self, key: String, offset: usize, len: usize) {
-        println!("track_key {key} {offset} {len}");
-        self.keys.insert(key, (offset, len));
+    for i in 5..8 {
+        let sender = table_2_sender.clone();
+        tokio::spawn(async move {
+            loop {
+                let rand_id = u16::from_be_bytes(rand_bytes(2).as_ref().try_into().unwrap());
+                let (tx, rx) = oneshot::channel();
+                let data = format!("this is the data for {rand_id}")
+                    .as_bytes()
+                    .to_vec();
+                let multiplied = data.iter().cycle().take(64 * 1024);
+                let bytes: Bytes = multiplied.copied().collect();
+                sender
+                    .send(Event::Put {
+                        key: format!("key/for/{i}{rand_id:0>5}"),
+                        data: bytes,
+                        timestamp: sstable::timestamp(),
+                        reply_to: tx,
+                    })
+                    .await
+                    .unwrap();
+                if let Err(res) = rx.await.unwrap() {
+                    tracing::error!("{res:?}");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
     }
 
-    async fn get(&mut self, key: String) -> Result<Data> {
-        let (offset, len) = dbg!(&self.keys).get(&key).unwrap();
-        let mut file = tokio::fs::File::open(&self.path).await.unwrap();
-
-        println!("seeking to {offset}");
-        file.seek(SeekFrom::Start(*offset as u64)).await.unwrap();
-        let mut bytes = BytesMut::zeroed(*len);
-        // let mut reader = bytes.reader();
-        println!("buf len {}", (&mut bytes).len());
-        file.read_exact(&mut bytes).await.unwrap();
-
-        dbg!(&bytes);
-        Ok(Data {
-            key,
-            value: bytes.into(),
-            timestamp: 0,
-        })
-    }
-
-    async fn flush(&mut self) -> Result<()> {
-        Ok(())
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    table_2_sender.send(Event::Shutdown).await.unwrap();
+    match table_2_handle.await.unwrap() {
+        Ok(_) | Err(Error::OkShutdown) => {
+            tracing::info!("bye!")
+        }
+        Err(e) => {
+            tracing::error!("{e:?}");
+        }
     }
 }
 

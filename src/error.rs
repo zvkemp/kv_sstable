@@ -5,8 +5,12 @@ pub enum Error {
     Other { description: String },
     Closed,
     NewerDataAlreadyHere,
-    DataNotFound,
+    DataNotFound { key: String },
     Io { source: io::Error },
+    OkShutdown,
+    KeyNotInRange,
+    NoTablesInCompaction,
+    MemTableClosed,
 }
 
 impl From<io::Error> for Error {
