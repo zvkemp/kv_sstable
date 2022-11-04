@@ -17,8 +17,7 @@ use tokio_stream::Stream;
 
 use crate::{error::Error, fixme};
 
-pub(crate) static WRITING_EXT: &str = "writing_index";
-pub(crate) static EXT: &str = "index";
+pub(crate) static INDEX: &str = "index";
 
 enum IndexInterleaverState {
     Active(Option<IndexRow>),
@@ -165,9 +164,9 @@ impl CompactionIndexInterleaver {
 }
 
 #[derive(Debug)]
-pub(crate) struct IndexRow {
-    pub(crate) key: String,
-    pub(crate) timestamp: Duration,
+pub struct IndexRow {
+    pub key: String,
+    pub timestamp: Duration,
     pub(crate) start: u64,
     pub(crate) len: u64,
 }
@@ -243,6 +242,15 @@ impl Stream for IndexRows {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.poll_next_row(cx).map(Result::transpose)
+    }
+}
+
+impl Stream for CompactionIndexInterleaver {
+    type Item = (usize, IndexRow);
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        fixme("do we need to handle errors from the inner streams?");
+        self.poll_next_row(cx)
     }
 }
 

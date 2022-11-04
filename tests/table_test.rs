@@ -171,7 +171,7 @@ async fn get_data(table_2_sender: &Sender<Event>, key: &str) -> Bytes {
         .await
         .unwrap();
 
-    let res = rx.await.unwrap().unwrap();
+    let (_ts, res) = rx.await.unwrap().unwrap();
 
     res
 }

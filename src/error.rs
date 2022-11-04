@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, path::PathBuf};
 
 #[derive(Debug)]
 pub enum Error {
@@ -12,6 +12,9 @@ pub enum Error {
     KeyNotInRange,
     NoTablesInCompaction,
     MemTableClosed,
+    SSTableAlreadyExists { path: PathBuf },
+    NoDataWasWritten,
+    InvalidUuid { input: String },
 }
 
 impl From<io::Error> for Error {

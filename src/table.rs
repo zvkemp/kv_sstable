@@ -1,5 +1,6 @@
 use std::{
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -13,12 +14,16 @@ use tokio::{
     task::JoinHandle,
     time::Instant,
 };
-use tracing::info;
+use tokio_stream::Stream;
+use tracing::{debug, info};
 
 use crate::{
     error::Error,
     fixme, fixme_msg,
-    sstable::{MemTable, SSTable},
+    sstable::{
+        index::{CompactionIndexInterleaver, IndexRow, IndexRows},
+        MemTable, SSTable,
+    },
 };
 
 pub struct Table {
@@ -33,6 +38,7 @@ pub struct Table {
     flush_handle: Option<JoinHandle<Result<(), Error>>>,
     compaction_task: Option<JoinHandle<Result<(), Error>>>,
     compaction_count: usize,
+    writable: bool,
 }
 
 // Table should be able to provide access to data in the following order:
@@ -71,6 +77,7 @@ pub enum Event {
         threshold: usize,
     },
     CompactionFinished(SSTable, Vec<SSTable>),
+    DropTable,
 }
 
 pub enum Reply {
@@ -78,7 +85,7 @@ pub enum Reply {
     Empty,
 }
 
-pub type ReplyToGet = oneshot::Sender<Result<Bytes, Error>>;
+pub type ReplyToGet = oneshot::Sender<Result<(Duration, Bytes), Error>>;
 pub type EmptyReplyTo = oneshot::Sender<Result<(), Error>>;
 
 impl Table {
@@ -108,24 +115,48 @@ impl Table {
         Ok((sender, handle))
     }
 
-    pub async fn new(path: impl AsRef<Path>, memtable_size_limit: usize) -> Result<Self, Error> {
+    pub async fn readonly(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let path = path.as_ref();
+        if !path.is_dir() {
+            return Err(Error::Other {
+                description: "directory does not exist".into(),
+            });
+        }
+
+        Self::new_inner(path, 0, false).await
+    }
+
+    // FIXME: pub makes no sense, but sometimes we want to expose writable
+    pub async fn new_inner(
+        path: impl AsRef<Path>,
+        memtable_size_limit: usize,
+        writable: bool,
+    ) -> Result<Self, Error> {
         tokio::fs::create_dir_all(&path).await.unwrap();
 
         let mut entries = tokio::fs::read_dir(&path).await.unwrap();
-        let mut write_logs = vec![];
-        let mut sstable_paths = vec![];
+        let mut write_logs: Vec<PathBuf> = vec![];
+        let mut sstable_paths: Vec<PathBuf> = vec![];
         loop {
             match entries.next_entry().await {
                 Ok(Some(entry)) => {
                     if entry.path().is_file() {
                         match entry.path().extension().and_then(|x| x.to_str()) {
                             Some("write_log") => write_logs.push(entry.path().to_owned()),
-                            Some("sstable") => sstable_paths.push(entry.path().to_owned()),
-                            _ => {
-                                // nothing to do
-                                ()
-                            }
+                            _ => (),
                         }
+                    } else if entry.path().is_dir() {
+                        fixme("validate directory somehow?");
+
+                        if entry.path().extension().and_then(|x| x.to_str()) == Some("writing") {
+                            tracing::error!(
+                                "Found a partially-written sstable at {:?}",
+                                entry.path()
+                            );
+                            continue;
+                        }
+
+                        sstable_paths.push(entry.path().to_owned())
                     }
                 }
                 Ok(None) => break,
@@ -133,29 +164,36 @@ impl Table {
             }
         }
 
+        // todo!("FIXME");
+
         tracing::debug!("found write_logs: {:?}", write_logs);
         tracing::debug!("found sstables: {:?}", sstable_paths);
 
-        let mut sstables = MemTable::recover_write_logs(write_logs).await?;
+        fixme("if we just load logs into the 'live' memtable instead, we can avoid branching for readonly tables");
+        let mut sstables = if writable {
+            MemTable::recover_write_logs(write_logs).await?
+        } else {
+            vec![]
+        };
 
         for path in sstable_paths {
-            sstables.push(SSTable::from_file(&path).await);
+            sstables.push(SSTable::from_dir(&path).await);
         }
 
-        sstables.sort_by(|a, b| a.uuid().cmp(&b.uuid()));
+        sstables.sort_by(|a, b| a.uuid_string().cmp(&b.uuid_string()));
 
         let mut generational_sstables = GenerationalSSTables::default();
 
         // partition the sstables into their generations.
         for sstable in sstables {
-            println!("{}", sstable.uuid());
+            debug!("loaded sstable {}", sstable.uuid());
 
             generational_sstables.push(sstable);
         }
 
         Ok(Table {
             path: path.as_ref().to_owned(),
-            live_memtable: MemTable::new(path.as_ref()).await?,
+            live_memtable: MemTable::new(writable.then_some(path.as_ref())).await?,
             previous_memtable: None,
             sstables: generational_sstables,
             memtable_size_limit,
@@ -165,11 +203,28 @@ impl Table {
             is_shutting_down: false,
             compaction_task: None,
             compaction_count: 0,
+            writable,
         })
     }
 
+    pub async fn new(path: impl AsRef<Path>, memtable_size_limit: usize) -> Result<Self, Error> {
+        Self::new_inner(path, memtable_size_limit, true).await
+    }
+
+    pub async fn list_keys(&self) -> Pin<Box<dyn Stream<Item = (usize, IndexRow)>>> {
+        let mut streams = vec![];
+
+        for generation in self.sstables.inner.iter() {
+            for sstable in generation.iter() {
+                streams.push(IndexRows::from_path(sstable.index_path()).await)
+            }
+        }
+
+        Box::pin(CompactionIndexInterleaver::new_from_streams(streams))
+    }
+
     async fn tick(&mut self) -> Result<(), Error> {
-        tracing::debug!("tick!");
+        tracing::trace!("tick!");
         if self.should_flush() {
             self.flush_live_memtable(false).await?;
         }
@@ -201,7 +256,7 @@ impl Table {
         let mut new_table = if self.is_shutting_down {
             MemTable::new_for_shutdown()
         } else {
-            MemTable::new(self.path.as_ref()).await?
+            MemTable::new(Some(self.path.as_ref())).await?
         };
 
         std::mem::swap(&mut new_table, &mut self.live_memtable);
@@ -258,11 +313,24 @@ impl Table {
             }) => self.compact_gen(generation, threshold).await,
             Some(Event::Compact { threshold }) => self.compact(threshold).await,
             Some(Event::CompactionFinished(new_sstable, old_sstables)) => {
-                tracing::info!("Compation finished; new_sstable = {new_sstable:?}");
+                tracing::info!("Compaction finished; new_sstable = {new_sstable:?}");
                 self.finalize_compaction(new_sstable, old_sstables).await
             }
             Some(Event::Shutdown) => {
                 self.shutdown().await?;
+                self.sender
+                    .as_ref()
+                    .unwrap()
+                    .send(Event::ShutdownFinished)
+                    .await
+                    .unwrap();
+
+                Ok(())
+            }
+            Some(Event::DropTable) => {
+                tracing::warn!("DROPPING TABLE AT {:?}", self.path);
+                self.shutdown().await?;
+                self.drop_data().await?;
                 self.sender
                     .as_ref()
                     .unwrap()
@@ -351,6 +419,8 @@ impl Table {
         self.is_shutting_down = true;
         self.flush_live_memtable(true).await?;
 
+        dbg!(&self.path);
+
         if let Some(task) = self.compaction_task.take() {
             tracing::warn!("awaiting live compaction...");
             // FIXME: clean up compaction
@@ -360,18 +430,30 @@ impl Table {
         Ok(())
     }
 
+    async fn drop_data(&mut self) -> Result<(), Error> {
+        if let Some(task) = self.compaction_task.take() {
+            fixme("allow compaction to be cancelled");
+        }
+
+        dbg!(self.sstables.decommission().await);
+
+        tokio::fs::remove_dir_all(&self.path).await?;
+
+        Ok(())
+    }
+
     async fn handle_get(&mut self, key: String, reply_to: ReplyToGet) -> Result<(), Error> {
         fixme("is it always correct to short-circuit if data was found in the live table?");
 
         tracing::debug!("TABLE::get[{key}]");
-        let response = if let Some((_ts, bytes)) = self.live_memtable.get(&key).cloned() {
-            Ok(bytes)
-        } else if let Some((_ts, bytes)) = self
+        let response = if let Some((ts, bytes)) = self.live_memtable.get(&key).cloned() {
+            Ok((ts, bytes))
+        } else if let Some((ts, bytes)) = self
             .previous_memtable
             .as_ref()
             .and_then(|prev| prev.get(&key).cloned())
         {
-            Ok(bytes)
+            Ok((ts, bytes))
         } else {
             self.find_in_sstables(key.as_str()).await
         };
@@ -383,7 +465,7 @@ impl Table {
         Ok(())
     }
 
-    async fn find_in_sstables(&mut self, key: &str) -> Result<Bytes, Error> {
+    async fn find_in_sstables(&mut self, key: &str) -> Result<(Duration, Bytes), Error> {
         self.sstables.find(key).await
     }
 
@@ -394,8 +476,13 @@ impl Table {
         timestamp: Duration,
         reply_to: EmptyReplyTo,
     ) -> Result<(), Error> {
+        tracing::debug!("TABLE::put[{key}@{timestamp:?}]");
         // FIXME: check if reply_to is opened, or if we timed out client-side
-        let res = self.live_memtable.insert(key, timestamp, data).await;
+        let res = if !self.writable {
+            Err(Error::MemTableClosed)
+        } else {
+            self.live_memtable.insert(key, timestamp, data).await
+        };
         // println!("sending reply");
         let _ = reply_to.send(res);
 
@@ -412,7 +499,9 @@ impl Table {
     }
 
     fn should_flush(&self) -> bool {
-        self.live_memtable.memsize() >= self.memtable_size_limit
+        self.live_memtable.memsize() > 0
+            && (self.live_memtable.memsize() >= self.memtable_size_limit
+                || self.live_memtable.last_insert_at.elapsed() > Duration::from_secs(120))
     }
 
     async fn finalize_compaction(
@@ -469,15 +558,15 @@ impl GenerationalSSTables {
             .remove(0)
     }
 
-    async fn find(&mut self, key: &str) -> Result<Bytes, Error> {
+    async fn find(&mut self, key: &str) -> Result<(Duration, Bytes), Error> {
         fixme("this isn't quite correct - need to find all sstables where the key is in range, then compare the results by timestamp");
         // what assumptions can we make about generational residency?
         fixme("track key ranges (max/min) on the generations");
         for generation in self.inner.iter_mut() {
             for sstable in generation.iter_mut().rev() {
                 match sstable.get(key).await {
-                    Ok(bytes) => {
-                        return Ok(bytes);
+                    Ok(res) => {
+                        return Ok(res);
                     }
                     Err(Error::KeyNotInRange) | Err(Error::DataNotFound { .. }) => {}
                     Err(e) => Err(e)?,
@@ -495,6 +584,16 @@ impl GenerationalSSTables {
     // generation count
     fn generation_count(&self) -> usize {
         self.inner.len()
+    }
+
+    async fn decommission(&mut self) -> Result<(), Error> {
+        for mut generation in self.inner.drain(0..) {
+            for sstable in generation.drain(0..) {
+                sstable.decommission().await;
+            }
+        }
+
+        Ok(())
     }
 }
 

@@ -8,6 +8,10 @@ edition = "2021"
 name = "dwkv"
 path = "src/lib.rs"
 
+[[bin]]
+name = "dwkv-cli"
+path = "src/bin/cli.rs"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -22,6 +26,7 @@ memmap2 = "*"
 tracing = "*"
 tracing-subscriber = "*"
 pin-project-lite = "*"
+md-5 = "^0.10.0"
 
 [dev-dependencies]
 tempdir = { version = "*" }
