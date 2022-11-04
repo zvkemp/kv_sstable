@@ -443,7 +443,7 @@ impl Table {
     }
 
     async fn handle_get(&mut self, key: String, reply_to: ReplyToGet) -> Result<(), Error> {
-        fixme("is it always correct to short-circuit if data was found in the live table?");
+        fixme("is it always correct to short-circuit if data was found in the live table? NO");
 
         tracing::debug!("TABLE::get[{key}]");
         let response = if let Some((ts, bytes)) = self.live_memtable.get(&key).cloned() {
@@ -481,6 +481,11 @@ impl Table {
         let res = if !self.writable {
             Err(Error::MemTableClosed)
         } else {
+            if let Some(found_ts) = self.find_greater_timestamp_for_key(&key, &timestamp).await {
+                tracing::warn!("Ignoring late-arriving key={key}@{timestamp:?}");
+                return Ok(());
+            }
+
             self.live_memtable.insert(key, timestamp, data).await
         };
         // println!("sending reply");
@@ -526,6 +531,25 @@ impl Table {
         Ok(())
     }
 
+    #[deprecated = "FIXME: explicitly test this logic"]
+    pub(crate) async fn find_greater_timestamp_for_key(
+        &mut self,
+        key: &str,
+        timestamp: &Duration,
+    ) -> Option<Duration> {
+        if self.previous_memtable.is_some() {
+            if let Some((found_ts, _)) = self.previous_memtable.as_ref().unwrap().get(key) {
+                if found_ts >= timestamp {
+                    return Some(*found_ts);
+                }
+            }
+        }
+
+        self.sstables
+            .find_greater_timestamp_for_key(key, timestamp)
+            .await
+    }
+
     // pub fn get(&self)
 }
 
@@ -541,6 +565,7 @@ impl GenerationalSSTables {
             self.inner.push(vec![]);
         }
 
+        fixme("check ordering on these; it's error-prone to have to rev the sstable iterator");
         self.inner
             .get_mut(sstable.generation())
             .expect("while loop should have pushed a vec here")
@@ -594,6 +619,24 @@ impl GenerationalSSTables {
         }
 
         Ok(())
+    }
+
+    async fn find_greater_timestamp_for_key(
+        &mut self,
+        key: &str,
+        timestamp: &Duration,
+    ) -> Option<Duration> {
+        // where to short-circuit?
+        // We only need to look in tables where the _max_ timestamp >= timestamp.
+        for generation in self.inner.iter_mut() {
+            for sstable in generation.iter_mut().rev() {
+                if let Some(res) = sstable.find_timestamp_greater_than(key, timestamp).await {
+                    return Some(res);
+                }
+            }
+        }
+
+        None
     }
 }
 

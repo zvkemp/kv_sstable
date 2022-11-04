@@ -81,6 +81,7 @@ impl SSTable {
 
         fixme("I don't like this one bit; the downgrade error has happened like twice but it's not easily reproduced");
         fixme("But probably better to panic than to segfault or hang forever.");
+        fixme("this _still_ happens despite the retry; perhaps we need to semaphore the clone? No more than one clone in the wild, and only in a compaction task.");
         let inner = loop {
             match Arc::try_unwrap(inner_arc) {
                 Ok(inner) => break inner,
@@ -111,6 +112,41 @@ impl SSTable {
 
     pub(crate) fn uuid_string(&self) -> String {
         self.uuid().to_string()
+    }
+
+    pub(crate) async fn find_timestamp_greater_than(
+        &mut self,
+        key: &str,
+        timestamp: &Duration,
+    ) -> Option<Duration> {
+        // These conditionals should weed out almost everything
+        if self.max_timestamp() > timestamp {
+            if self.first_key() <= key && self.last_key() >= key {
+                if let Some((found_ts, _, _)) = self.get_key(key).await {
+                    if &found_ts >= timestamp {
+                        return Some(found_ts);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn max_timestamp(&self) -> &Duration {
+        &self.inner.summary.max_timestamp
+    }
+
+    fn min_timestamp(&self) -> &Duration {
+        &self.inner.summary.min_timestamp
+    }
+
+    fn first_key(&self) -> &str {
+        self.inner.summary.first_key.as_str()
+    }
+
+    fn last_key(&self) -> &str {
+        self.inner.summary.last_key.as_str()
     }
 }
 
@@ -435,6 +471,8 @@ pub fn rand_guid(n: usize) -> String {
 pub struct Summary {
     first_key: String,
     last_key: String,
+    min_timestamp: Duration,
+    max_timestamp: Duration,
     key_count: usize,
     timestamp: Duration,
     path: PathBuf,
@@ -563,6 +601,8 @@ impl SSTableWriter {
 
         let mut first_key = None;
         let mut last_key = None;
+        let mut min_timestamp = None;
+        let mut max_timestamp = None;
         let mut key_count = 0;
 
         while let Some((timestamp, key, data)) = sorted_data.next().await {
@@ -572,6 +612,18 @@ impl SSTableWriter {
 
             // FIXME: better way to track this?
             last_key = Some(key.clone());
+
+            if min_timestamp.is_none() {
+                min_timestamp = Some(timestamp);
+            }
+
+            if max_timestamp.is_none() {
+                max_timestamp = Some(timestamp);
+            }
+
+            // FIXME: do this without copying?
+            min_timestamp = std::cmp::min(min_timestamp, Some(timestamp));
+            max_timestamp = std::cmp::max(max_timestamp, Some(timestamp));
 
             key_count += 1;
 
@@ -605,6 +657,10 @@ impl SSTableWriter {
         let summary = Summary {
             first_key,
             last_key,
+            min_timestamp: min_timestamp
+                .expect("should not have missing timestamps if a key was written"),
+            max_timestamp: max_timestamp
+                .expect("should not have missing timestamps if a key was written"),
             key_count,
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
             path: enclosing_directory.clone(),
@@ -647,17 +703,7 @@ impl MemTable {
 }
 
 impl SSTable {
-    pub async fn get(&mut self, key: &str) -> Result<(Duration, Bytes), Error> {
-        if key < self.inner.summary.first_key.as_str() || key > self.inner.summary.last_key.as_str()
-        {
-            return Err(Error::KeyNotInRange);
-        }
-        tracing::debug!(
-            "SSTABLE::get[{key} ({} .. {})]",
-            self.inner.summary.first_key,
-            self.inner.summary.last_key
-        );
-
+    pub async fn get_key(&mut self, key: &str) -> Option<(Duration, u64, u64)> {
         fixme("where does this belong?");
         if self.inner.summary.index.read().await.is_none() {
             let mut write = self.inner.summary.index.write().await;
@@ -666,18 +712,29 @@ impl SSTable {
         }
 
         let idx_read = self.inner.summary.index.read().await;
+        idx_read.as_ref().unwrap().get(key).map(ToOwned::to_owned)
+    }
+
+    pub async fn get(&mut self, key: &str) -> Result<(Duration, Bytes), Error> {
+        if key < self.first_key() || key > self.last_key() {
+            return Err(Error::KeyNotInRange);
+        }
+        tracing::debug!(
+            "SSTABLE::get[{key} ({} .. {})]",
+            self.inner.summary.first_key,
+            self.inner.summary.last_key
+        );
+
         let (timestamp, position, len) =
-            idx_read
-                .as_ref()
-                .unwrap()
-                .get(key)
+            self.get_key(&key)
+                .await
                 .ok_or_else(|| Error::DataNotFound {
                     key: key.to_owned(),
                 })?;
 
         let now = Instant::now();
 
-        let start = *position as usize;
+        let start = position as usize;
         let end = (position + len) as usize;
         let data = &self.inner.mmap[start..end];
 
@@ -691,7 +748,7 @@ impl SSTable {
         // let timestamp = Duration::new(seconds, nanoseconds);
 
         // Ok((timestamp, data))
-        Ok((*timestamp, Bytes::copy_from_slice(data)))
+        Ok((timestamp, Bytes::copy_from_slice(data)))
     }
 
     pub(crate) async fn compact(tables: &[SSTable]) -> Result<SSTable, Error> {
