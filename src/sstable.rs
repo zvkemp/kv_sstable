@@ -76,7 +76,28 @@ impl SSTable {
     }
 
     pub(crate) async fn decommission(self) -> Result<(), Error> {
-        let inner = Arc::try_unwrap(self.inner).expect("memory leak!");
+        let mut tries = 5;
+        let mut inner_arc = self.inner;
+
+        fixme("I don't like this one bit; the downgrade error has happened like twice but it's not easily reproduced");
+        fixme("But probably better to panic than to segfault or hang forever.");
+        let inner = loop {
+            match Arc::try_unwrap(inner_arc) {
+                Ok(inner) => break inner,
+                Err(ret) => {
+                    if tries == 0 {
+                        panic!("memory leak");
+                    }
+
+                    inner_arc = ret;
+
+                    tries -= 1;
+                    tracing::error!("Someone holding onto a reference for a decomissioned table. remaining tries = {tries}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        };
+
         inner.decommission().await
     }
 
