@@ -11,10 +11,11 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use md5::{Digest, Md5};
 use memmap2::Mmap;
+use pin_project_lite::pin_project;
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     stream,
     sync::RwLock,
     time::Instant,
@@ -82,9 +83,8 @@ impl SSTable {
         let mut tries = 5;
         let mut inner_arc = self.inner;
 
-        fixme("I don't like this one bit; the downgrade error has happened like twice but it's not easily reproduced");
-        fixme("But probably better to panic than to segfault or hang forever.");
-        fixme("this _still_ happens despite the retry; perhaps we need to semaphore the clone? No more than one clone in the wild, and only in a compaction task.");
+        // NOTE: this originally happened because during the gap between removing the compaction task
+        // and finalizing the compaction, another compaction task could start. That has been fixed.
         let inner = loop {
             match Arc::try_unwrap(inner_arc) {
                 Ok(inner) => break inner,
@@ -196,19 +196,23 @@ impl MemTable {
         checksum: &Checksum,
     ) -> Result<(), Error> {
         if let Some((prev_ts, prev_data)) = self.data.get(&key) {
-            if prev_ts > &timestamp {
-                // keep the 'old' data because it has a newer timestamp
-                // FIXME: do we need to write-log it?
-                return Err(Error::NewerDataAlreadyHere);
-            } else if prev_ts == &timestamp {
-                if data == prev_data {
-                    fixme_msg(println!("data eq"), "why is this happening?");
-                    return Ok(());
-                } else {
+            match prev_ts.cmp(&timestamp) {
+                std::cmp::Ordering::Greater => {
+                    // keep the 'old' data because it has a newer timestamp
+                    // FIXME: do we need to write-log it?
                     return Err(Error::NewerDataAlreadyHere);
                 }
-            } else {
-                self.memsize -= prev_data.len();
+                std::cmp::Ordering::Equal => {
+                    if data == prev_data {
+                        fixme_msg(println!("data eq"), "why is this happening?");
+                        return Ok(());
+                    } else {
+                        return Err(Error::NewerDataAlreadyHere);
+                    }
+                }
+                std::cmp::Ordering::Less => {
+                    self.memsize -= prev_data.len();
+                }
             }
         }
 
@@ -240,10 +244,7 @@ impl MemTable {
         // bytes
         // \n\r? or some other terminator?
         // self.write_log.
-        let write_log = self
-            .write_log
-            .as_mut()
-            .ok_or_else(|| Error::MemTableClosed)?;
+        let write_log = self.write_log.as_mut().ok_or(Error::MemTableClosed)?;
         let mut buf = BufWriter::new(&mut *write_log);
 
         buf.write_u8(key.len() as u8).await.unwrap();
@@ -310,11 +311,11 @@ impl MemTable {
         let mut sstables = vec![];
 
         for write_log in write_logs {
-            let uuid = write_log.file_stem().unwrap().to_string_lossy().to_owned();
+            let uuid = write_log.file_stem().unwrap().to_string_lossy();
 
             let mut memtable = MemTable {
                 data: Default::default(),
-                uuid: dbg!(uuid.parse()?),
+                uuid: uuid.parse()?,
                 write_log: None,
                 memsize: 0,
                 last_insert_at: Instant::now(),
@@ -397,7 +398,7 @@ impl MemTable {
         }
 
         let key = String::from_utf8(key.to_vec()).expect("FIXME");
-        let entry = (key, Duration::new(secs, nanos), data.into(), checksum);
+        let entry = (key, Duration::new(secs, nanos), data, checksum);
         Ok(entry)
     }
 
@@ -414,6 +415,29 @@ impl MemTable {
         }
 
         Ok(())
+    }
+}
+
+pin_project! {
+    struct Md5BufReader<R> {
+        #[pin]
+        inner: BufReader<R>,
+        hasher: Option<Md5>,
+    }
+}
+
+impl<R: AsyncRead> AsyncRead for Md5BufReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.project();
+
+        match this.inner.poll_read(cx, buf) {
+            std::task::Poll::Ready(_) => todo!(),
+            std::task::Poll::Pending => todo!(),
+        }
     }
 }
 
@@ -472,7 +496,7 @@ impl SSTable {
         sstable.write_all_buf(&mut bytes).await.unwrap();
         sstable.write_all_buf(&mut checksum_slice).await.unwrap();
         index_file
-            .write_all_buf(&mut index::serialize_row(&key, ts, *offset, len))
+            .write_all_buf(&mut index::serialize_row(key, ts, *offset, len))
             .await
             .unwrap();
 
@@ -784,11 +808,9 @@ impl SSTable {
         );
 
         let (timestamp, position, len) =
-            self.get_key(&key)
-                .await
-                .ok_or_else(|| Error::DataNotFound {
-                    key: key.to_owned(),
-                })?;
+            self.get_key(key).await.ok_or_else(|| Error::DataNotFound {
+                key: key.to_owned(),
+            })?;
 
         let now = Instant::now();
 
@@ -975,9 +997,9 @@ mod tests {
 
         // println!("summary={summary:?}");
 
-        let (_, fetched_798) = sstable.get(&format!("key/for/0000798")).await.unwrap();
-        let (_, fetched_124) = sstable.get(&format!("key/for/0000124")).await.unwrap();
-        let (_, fetched_432) = sstable.get(&format!("key/for/0000432")).await.unwrap();
+        let (_, fetched_798) = sstable.get("key/for/0000798").await.unwrap();
+        let (_, fetched_124) = sstable.get("key/for/0000124").await.unwrap();
+        let (_, fetched_432) = sstable.get("key/for/0000432").await.unwrap();
 
         assert_eq!(fetched_124, data_124.1);
         assert_eq!(fetched_432, data_432.1);
@@ -987,7 +1009,7 @@ mod tests {
 
         for i in 0..1000 {
             println!("{i}");
-            let (_, _fetched_124) = sstable.get(&format!("key/for/0000124")).await.unwrap();
+            let (_, _fetched_124) = sstable.get("key/for/0000124").await.unwrap();
         }
 
         println!("1000 fetches in {:?}", time.elapsed());

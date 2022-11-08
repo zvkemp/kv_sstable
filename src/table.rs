@@ -88,6 +88,10 @@ pub enum Reply {
 pub type ReplyToGet = oneshot::Sender<Result<(Duration, Bytes), Error>>;
 pub type EmptyReplyTo = oneshot::Sender<Result<(), Error>>;
 
+pub type TableSender = Sender<Event>;
+pub type TableHandle = JoinHandle<Result<(), Error>>;
+pub type TableSpawn = (TableSender, TableHandle);
+
 impl Table {
     // each live table runs an event loop
     async fn run(mut self, mut receiver: Receiver<Event>) -> Result<(), Error> {
@@ -106,7 +110,7 @@ impl Table {
         }
     }
 
-    pub fn spawn(mut self) -> Result<(Sender<Event>, JoinHandle<Result<(), Error>>), Error> {
+    pub fn spawn(mut self) -> Result<TableSpawn, Error> {
         // FIXME: should these channels just go in new?
         let (sender, receiver) = tokio::sync::mpsc::channel(24);
         self.sender = Some(sender.clone());
@@ -141,9 +145,9 @@ impl Table {
             match entries.next_entry().await {
                 Ok(Some(entry)) => {
                     if entry.path().is_file() {
-                        match entry.path().extension().and_then(|x| x.to_str()) {
-                            Some("write_log") => write_logs.push(entry.path().to_owned()),
-                            _ => (),
+                        if let Some("write_log") = entry.path().extension().and_then(|x| x.to_str())
+                        {
+                            write_logs.push(entry.path().to_owned());
                         }
                     } else if entry.path().is_dir() {
                         fixme("validate directory somehow?");
@@ -182,7 +186,7 @@ impl Table {
             sstables.push(SSTable::from_dir(&path).await);
         }
 
-        sstables.sort_by(|a, b| a.uuid_string().cmp(&b.uuid_string()));
+        sstables.sort_by_key(|a| a.uuid_string());
 
         let mut generational_sstables = GenerationalSSTables::default();
 
@@ -376,12 +380,8 @@ impl Table {
 
         fixme("this may be contentious between generations");
         if self.compaction_task.is_some() {
-            if self.compaction_task.as_ref().unwrap().is_finished() {
-                self.compaction_task.take().unwrap().await.unwrap().unwrap();
-            } else {
-                tracing::error!("Compaction in progress, can't start another one");
-                return Ok(());
-            }
+            tracing::error!("Compaction in progress, can't start another one");
+            return Ok(());
         }
 
         if self.sstables.length_of(gen) < threshold {
@@ -535,6 +535,13 @@ impl Table {
 
             old_sstable.decommission().await.unwrap();
         }
+
+        self.compaction_task
+            .take()
+            .expect("compaction task should have been here")
+            .await
+            .unwrap()
+            .unwrap();
 
         Ok(())
     }
