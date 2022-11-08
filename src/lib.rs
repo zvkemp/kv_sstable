@@ -1,3 +1,5 @@
+#![deny(unused_must_use)]
+
 use std::{collections::HashMap, time::Duration};
 
 pub mod error;

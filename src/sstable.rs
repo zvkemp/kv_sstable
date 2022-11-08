@@ -9,6 +9,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use md5::{Digest, Md5};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -37,6 +38,8 @@ pub(crate) static SUMMARY_EXT: &str = "summary";
 pub struct Topic {
     pub path: PathBuf,
 }
+
+pub type Checksum = [u8; 16];
 
 impl Topic {
     pub fn new(path: impl Into<PathBuf>) -> Self {
@@ -178,7 +181,9 @@ impl MemTable {
         timestamp: Duration,
         data: Bytes,
     ) -> Result<(), Error> {
-        self.insert_inner(key, timestamp, data, true).await
+        let checksum = md5sum(&data);
+        self.insert_inner(key, timestamp, data, true, &checksum)
+            .await
     }
 
     async fn insert_inner(
@@ -186,25 +191,29 @@ impl MemTable {
         key: String,
         timestamp: Duration,
         data: Bytes,
+        // this will be false if we are recovering a write log
         write_to_log: bool,
+        checksum: &Checksum,
     ) -> Result<(), Error> {
-        fixme("only accept data newer than the memtables started at timestamp?");
-        fixme("also write this insert to an append-only log");
-
         if let Some((prev_ts, prev_data)) = self.data.get(&key) {
             if prev_ts > &timestamp {
                 // keep the 'old' data because it has a newer timestamp
                 // FIXME: do we need to write-log it?
                 return Err(Error::NewerDataAlreadyHere);
             } else if prev_ts == &timestamp {
-                todo!("wtf to do here");
+                if data == prev_data {
+                    fixme_msg(println!("data eq"), "why is this happening?");
+                    return Ok(());
+                } else {
+                    return Err(Error::NewerDataAlreadyHere);
+                }
             } else {
                 self.memsize -= prev_data.len();
             }
         }
 
         if write_to_log {
-            self.write_log(&key, &timestamp, &data).await?;
+            self.write_log(&key, &timestamp, &data, checksum).await?;
         }
 
         self.memsize += data.len();
@@ -219,6 +228,7 @@ impl MemTable {
         key: &str,
         timestamp: &Duration,
         data: &Bytes,
+        checksum: &Checksum,
     ) -> Result<(), Error> {
         fixme("should these be delimited somehow?");
         // write-log format should be:
@@ -242,6 +252,7 @@ impl MemTable {
         buf.write_u32(timestamp.subsec_nanos()).await.unwrap();
         buf.write_u64(data.len() as u64).await.unwrap();
         buf.write_all(data.as_ref()).await.unwrap();
+        buf.write_all(checksum.as_slice()).await.unwrap();
         buf.write_all("\r\n".as_bytes()).await.unwrap();
         buf.flush().await.unwrap();
 
@@ -303,7 +314,7 @@ impl MemTable {
 
             let mut memtable = MemTable {
                 data: Default::default(),
-                uuid: uuid.parse()?,
+                uuid: dbg!(uuid.parse()?),
                 write_log: None,
                 memsize: 0,
                 last_insert_at: Instant::now(),
@@ -314,9 +325,11 @@ impl MemTable {
 
             loop {
                 // could have stopped writing anywhere in a non-clean shutdown, so just process until EOF
-                match Self::from_write_logs_loop_inner(&mut reader).await {
-                    Ok((key, timestamp, data)) => {
-                        memtable.insert_inner(key, timestamp, data, false).await?
+                match dbg!(Self::from_write_logs_loop_inner(&mut reader).await) {
+                    Ok((key, timestamp, data, checksum)) => {
+                        memtable
+                            .insert_inner(key, timestamp, data, false, &checksum)
+                            .await?
                     }
 
                     Err(e) => {
@@ -343,7 +356,7 @@ impl MemTable {
 
     async fn from_write_logs_loop_inner(
         reader: &mut BufReader<File>,
-    ) -> Result<(String, Duration, Bytes), std::io::Error> {
+    ) -> Result<(String, Duration, Bytes, Checksum), std::io::Error> {
         // buf.write_u8(key.len() as u8).await.unwrap();
         let keylen = reader.read_u8().await?;
         let mut key = BytesMut::zeroed(keylen as usize);
@@ -358,6 +371,10 @@ impl MemTable {
         // buf.write_all(data.as_ref()).await.unwrap();
         let mut data = BytesMut::zeroed(len as usize);
         reader.read_exact(&mut data).await?;
+
+        let mut checksum = [0u8; 16];
+        reader.read_exact(&mut checksum).await?;
+
         let trailer = vec![reader.read_u8().await?, reader.read_u8().await?];
 
         if trailer != "\r\n".as_bytes() {
@@ -367,14 +384,45 @@ impl MemTable {
             ));
         }
 
+        let data: Bytes = data.into();
+
+        let checksum2 = md5sum(&data);
+
+        if checksum2 != checksum {
+            // return Err(std::io::Error::new(
+            //     IoErrorKind::InvalidData,
+            //     Error::InvalidChecksum,
+            // ));
+            fixme(panic!("(FIXME: return an error for invalid checksum"));
+        }
+
         let key = String::from_utf8(key.to_vec()).expect("FIXME");
-        let entry = (key, Duration::new(secs, nanos), data.into());
+        let entry = (key, Duration::new(secs, nanos), data.into(), checksum);
         Ok(entry)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
+
+    pub(crate) async fn sync_write_log(&mut self) -> Result<(), Error> {
+        println!("sync write log");
+        return Ok(()); // FIXME:
+        if let Some(write_log) = self.write_log.as_mut() {
+            write_log.flush().await.unwrap();
+            write_log.sync_all().await.unwrap();
+        }
+
+        Ok(())
+    }
+}
+
+fn md5sum(data: impl AsRef<[u8]>) -> Checksum {
+    return fixme_msg([0; 16], "the real md5 makes things very very very slow");
+    let mut hasher = Md5::new();
+    hasher.update(data);
+    let hash = hasher.finalize();
+    hash.as_slice().try_into().unwrap()
 }
 
 impl SSTable {
@@ -412,19 +460,23 @@ impl SSTable {
         key: &str,
         ts: &Duration,
         mut bytes: &[u8],
+        checksum: Checksum,
         sstable: &mut File,
         index_file: &mut File,
         offset: &mut usize,
     ) -> Result<(), Error> {
         let len = bytes.len();
 
+        let mut checksum_slice = checksum.as_slice();
+
         sstable.write_all_buf(&mut bytes).await.unwrap();
+        sstable.write_all_buf(&mut checksum_slice).await.unwrap();
         index_file
             .write_all_buf(&mut index::serialize_row(&key, ts, *offset, len))
             .await
             .unwrap();
 
-        *offset += len;
+        *offset += len + 16;
 
         Ok(())
     }
@@ -627,12 +679,15 @@ impl SSTableWriter {
 
             key_count += 1;
 
+            let checksum = md5sum(&data);
+
             // #[cfg(fixme)]
             // let (ts, bytes) = self.data.get(&key).unwrap();
             SSTable::write_key_and_value(
                 &key,
                 &timestamp,
                 data.as_ref(),
+                checksum,
                 &mut sstable_file,
                 &mut index_file,
                 &mut offset,
@@ -705,6 +760,9 @@ impl MemTable {
 impl SSTable {
     pub async fn get_key(&mut self, key: &str) -> Option<(Duration, u64, u64)> {
         fixme("where does this belong?");
+
+        fixme("it probably makes more sense to keep the index in a LRU row cache attached to the Table ");
+        fixme("that can page in chunks of this index as necessary");
         if self.inner.summary.index.read().await.is_none() {
             let mut write = self.inner.summary.index.write().await;
             let entries = self.inner.summary.load_index().await;
@@ -737,6 +795,13 @@ impl SSTable {
         let start = position as usize;
         let end = (position + len) as usize;
         let data = &self.inner.mmap[start..end];
+        let checksum = &self.inner.mmap[end..(end + 16)];
+
+        let checksum2 = md5sum(data);
+
+        if checksum != checksum2 {
+            return Err(Error::InvalidChecksum);
+        }
 
         // let mut ts_data = Bytes::copy_from_slice(data);
         // let data = ts_data.split_off(std::mem::size_of::<u64>() + std::mem::size_of::<u32>());

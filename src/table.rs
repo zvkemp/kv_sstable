@@ -167,11 +167,13 @@ impl Table {
         // todo!("FIXME");
 
         tracing::debug!("found write_logs: {:?}", write_logs);
+        println!("found write_logs: {:?}", write_logs);
         tracing::debug!("found sstables: {:?}", sstable_paths);
+        println!("found sstables: {:?}", sstable_paths);
 
         fixme("if we just load logs into the 'live' memtable instead, we can avoid branching for readonly tables");
         let mut sstables = if writable {
-            MemTable::recover_write_logs(write_logs).await?
+            dbg!(MemTable::recover_write_logs(write_logs).await)?
         } else {
             vec![]
         };
@@ -227,6 +229,8 @@ impl Table {
         tracing::trace!("tick!");
         if self.should_flush() {
             self.flush_live_memtable(false).await?;
+        } else {
+            self.sync_write_log().await?;
         }
 
         self.sender
@@ -435,7 +439,7 @@ impl Table {
             fixme("allow compaction to be cancelled");
         }
 
-        dbg!(self.sstables.decommission().await);
+        let _ = fixme_msg(dbg!(self.sstables.decommission().await), "handle error");
 
         tokio::fs::remove_dir_all(&self.path).await?;
 
@@ -507,6 +511,10 @@ impl Table {
         self.live_memtable.memsize() > 0
             && (self.live_memtable.memsize() >= self.memtable_size_limit
                 || self.live_memtable.last_insert_at.elapsed() > Duration::from_secs(120))
+    }
+
+    async fn sync_write_log(&mut self) -> Result<(), Error> {
+        self.live_memtable.sync_write_log().await
     }
 
     async fn finalize_compaction(
@@ -614,7 +622,7 @@ impl GenerationalSSTables {
     async fn decommission(&mut self) -> Result<(), Error> {
         for mut generation in self.inner.drain(0..) {
             for sstable in generation.drain(0..) {
-                sstable.decommission().await;
+                let _ = fixme_msg(sstable.decommission().await, "handle error");
             }
         }
 
