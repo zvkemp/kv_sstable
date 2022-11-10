@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
-    stream,
     sync::RwLock,
     time::Instant,
 };
@@ -25,15 +24,13 @@ use tokio_stream::{Stream, StreamExt};
 use crate::{
     error::Error,
     fixme, fixme_msg,
-    sstable::index::{CompactionIndexInterleaver, IndexRows},
+    sstable::index::{CompactionIndexInterleaver, DynIndexStream, IndexRows},
 };
 
 pub(crate) mod data;
 pub(crate) mod index;
 
-pub(crate) static WRITING_SSTABLE_EXT: &str = "writing_sstable";
 pub(crate) static SSTABLE_EXT: &str = "sstable";
-pub(crate) static WRITING_SUMMARY_EXT: &str = "writing_summary";
 pub(crate) static SUMMARY_EXT: &str = "summary";
 
 pub struct Topic {
@@ -136,25 +133,25 @@ impl SSTable {
         None
     }
 
-    fn max_timestamp(&self) -> &Duration {
+    pub(crate) fn max_timestamp(&self) -> &Duration {
         &self.inner.summary.max_timestamp
     }
 
-    fn min_timestamp(&self) -> &Duration {
+    pub(crate) fn min_timestamp(&self) -> &Duration {
         &self.inner.summary.min_timestamp
     }
 
-    fn first_key(&self) -> &str {
+    pub(crate) fn first_key(&self) -> &str {
         self.inner.summary.first_key.as_str()
     }
 
-    fn last_key(&self) -> &str {
+    pub(crate) fn last_key(&self) -> &str {
         self.inner.summary.last_key.as_str()
     }
 }
 
 pub struct MemTable {
-    data: HashMap<String, (Duration, Bytes)>,
+    pub(crate) data: HashMap<String, (Duration, Bytes)>,
     uuid: Uuid,
     write_log: Option<File>,
     // the size in-memory of the Bytes data only (does not include timestamps or keys)
@@ -326,7 +323,7 @@ impl MemTable {
 
             loop {
                 // could have stopped writing anywhere in a non-clean shutdown, so just process until EOF
-                match dbg!(Self::from_write_logs_loop_inner(&mut reader).await) {
+                match Self::from_write_logs_loop_inner(&mut reader).await {
                     Ok((key, timestamp, data, checksum)) => {
                         memtable
                             .insert_inner(key, timestamp, data, false, &checksum)
@@ -407,7 +404,6 @@ impl MemTable {
     }
 
     pub(crate) async fn sync_write_log(&mut self) -> Result<(), Error> {
-        println!("sync write log");
         return Ok(()); // FIXME:
         if let Some(write_log) = self.write_log.as_mut() {
             write_log.flush().await.unwrap();
@@ -516,9 +512,12 @@ impl SSTableInner {
         drop(self.mmap);
 
         tokio::fs::remove_file(sstable_path).await?;
-        tokio::fs::remove_file(index_path).await?;
-        tokio::fs::remove_file(summary_path).await?;
-        tokio::fs::remove_dir(self.summary.path).await?;
+        fixme("should we retain the index and summary in case we have a stream running?");
+        // tokio::fs::remove_file(index_path).await?;
+        fixme("should we retain the index and summary in case we have a stream running?");
+        // tokio::fs::remove_file(summary_path).await?;
+        // tokio::fs::remove_dir(self.summary.path).await?;
+        fixme("we can clean up dangling indexes and summaries if the streams vec is empty");
 
         Ok(())
     }
@@ -569,7 +568,7 @@ pub struct Uuid {
 }
 
 impl Uuid {
-    fn new_with_generation(generation: usize) -> Self {
+    pub fn new_with_generation(generation: usize) -> Self {
         let timestamp = timestamp();
         let guid = rand_guid(16);
 
@@ -642,7 +641,7 @@ impl SSTableWriter {
     pub(crate) async fn write_data(
         &self,
         path: &Path,
-        mut sorted_data: impl Stream<Item = (Duration, String, impl AsRef<[u8]>)> + Unpin,
+        mut sorted_data: impl Stream<Item = Result<(Duration, String, impl AsRef<[u8]>), Error>> + Unpin,
     ) -> Result<SSTable, Error> {
         let enclosing_directory = path.join(self.uuid.to_string()).to_owned();
         let working_directory = enclosing_directory.with_extension("writing");
@@ -681,7 +680,8 @@ impl SSTableWriter {
         let mut max_timestamp = None;
         let mut key_count = 0;
 
-        while let Some((timestamp, key, data)) = sorted_data.next().await {
+        while let Some(res) = sorted_data.next().await {
+            let (timestamp, key, data) = res?;
             if first_key.is_none() {
                 first_key = Some(key.clone());
             }
@@ -772,7 +772,7 @@ impl MemTable {
         // so there are a few things copied here. `bytes.clone()` should be efficient however.
         let data_stream = keys.into_iter().map(|key| {
             let (ts, bytes) = self.data.get(&key).unwrap();
-            (*ts, key, bytes.clone())
+            Ok((*ts, key, bytes.clone()))
         });
 
         table_writer
@@ -866,7 +866,7 @@ impl SSTable {
 
         for index_path in index_paths {
             let stream = IndexRows::from_path(&index_path).await;
-            index_iterators.push(stream);
+            index_iterators.push(Box::new(stream) as DynIndexStream);
         }
 
         let original_key_count: usize = tables.iter().map(|x| x.inner.summary.key_count).sum();
@@ -875,17 +875,20 @@ impl SSTable {
 
         let writer = SSTableWriter::from_generation(generation);
 
-        let data_stream = interleaver.map(|(table_index, row)| {
-            let timestamp = row.timestamp;
-            let key = row.key;
+        let data_stream = interleaver.map(|res| {
+            res.map(|(table_index, row)| {
+                let timestamp = row.timestamp;
+                let key = row.key;
 
-            let start = row.start as usize;
-            let end = start + row.len as usize;
+                let start = row.start as usize;
+                let end = start + row.len as usize;
 
-            let data = &(tables.get(table_index).unwrap().inner.mmap)[start..end];
+                let data = &(tables.get(table_index).unwrap().inner.mmap)[start..end];
 
-            (timestamp, key, data)
+                (timestamp, key, data)
+            })
         });
+
         let new_sstable = writer.write_data(&root_path, data_stream).await?;
 
         let key_count = new_sstable.inner.summary.key_count;

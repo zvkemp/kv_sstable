@@ -24,12 +24,18 @@ enum IndexInterleaverState {
     Done,
 }
 
+pub(crate) type DynIndexStream =
+    Box<dyn Stream<Item = IndexRowResult> + Send + Sync + Unpin + 'static>;
+
+type IndexRowResult = Result<IndexRow, Error>;
+
 pin_project! {
     /// yields values from multiple indexes in alphabetical order, discarding all but the newest timestamp for duplicates.
     pub(crate) struct CompactionIndexInterleaver {
-        streams: Vec<IndexRows>,
+        streams: Vec<DynIndexStream>,
         states: Vec<IndexInterleaverState>,
         buf: Vec<(usize, IndexRow)>,
+        has_errored: bool,
     }
 }
 
@@ -52,7 +58,9 @@ impl IndexInterleaverState {
 // Given several IndexRows, yields all index values in alphabetical order,
 // discarding duplicates (keeping those with the newest timestamp).
 impl CompactionIndexInterleaver {
-    pub(crate) fn new_from_streams(streams: Vec<IndexRows>) -> Self {
+    /// Create a new index interleaver. Streams must yield their values in alphabetical order,
+    /// and must be internally unique. Duplicates between streams will be resolved by a timestamp comparison (newest wins).
+    pub(crate) fn new_from_streams(streams: Vec<DynIndexStream>) -> Self {
         let states = (0..streams.len())
             .map(|_| IndexInterleaverState::Active(None))
             .collect();
@@ -61,17 +69,18 @@ impl CompactionIndexInterleaver {
             streams,
             states,
             buf: vec![],
+            has_errored: false,
         }
     }
 
-    pub(crate) async fn next_row(&mut self) -> Option<(usize, IndexRow)> {
+    pub(crate) async fn next_row(&mut self) -> Option<Result<(usize, IndexRow), Error>> {
         poll_fn(|cx| Pin::new(&mut *self).poll_next_row(cx)).await
     }
 
     fn poll_next_row(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
-    ) -> Poll<Option<(usize, IndexRow)>> {
+    ) -> Poll<Option<Result<(usize, IndexRow), Error>>> {
         let this = self.project();
 
         // Check all streams; if any is pending we must return pending.
@@ -85,13 +94,16 @@ impl CompactionIndexInterleaver {
                                 tracing::debug!("poll_next_row: {index} :: --> Poll::Ready(None)");
                                 this.states[index] = IndexInterleaverState::Done;
                             }
-                            Some(row) => {
+                            Some(Ok(row)) => {
                                 tracing::debug!(
                                     "poll_next_row: {index} :: --> Poll::Ready(Some({row:?}))"
                                 );
-                                this.states[index] = IndexInterleaverState::Active(Some(
-                                    row.expect("FIXME don't unwrap this"),
-                                ));
+                                this.states[index] = IndexInterleaverState::Active(Some(row));
+                            }
+
+                            Some(Err(e)) => {
+                                *this.has_errored = true;
+                                return Poll::Ready(Some(Err(e)));
                             }
                         },
 
@@ -159,7 +171,7 @@ impl CompactionIndexInterleaver {
 
         let index_row = this.states[tail].pop_row().unwrap();
 
-        Poll::Ready(Some((tail, index_row)))
+        Poll::Ready(Some(Ok((tail, index_row))))
     }
 }
 
@@ -176,6 +188,7 @@ pin_project! {
         #[pin]
         reader: BufReader<File>,
         internal_buf: Vec<u8>,
+        has_errored: bool,
     }
 }
 
@@ -185,6 +198,7 @@ impl IndexRows {
         IndexRows {
             reader,
             internal_buf: Vec::new(),
+            has_errored: false,
         }
     }
 
@@ -196,6 +210,10 @@ impl IndexRows {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<IndexRow>, Error>> {
+        if self.has_errored {
+            return Poll::Ready(Ok(None));
+        }
+
         let mut this = self.project();
 
         loop {
@@ -224,7 +242,8 @@ impl IndexRows {
                             }
 
                             Poll::Ready(Err(e)) => {
-                                todo!()
+                                *this.has_errored = true;
+                                return Poll::Ready(Err(e.into()));
                             }
                             Poll::Pending => {
                                 return Poll::Pending;
@@ -238,7 +257,7 @@ impl IndexRows {
 }
 
 impl Stream for IndexRows {
-    type Item = Result<IndexRow, Error>;
+    type Item = IndexRowResult;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.poll_next_row(cx).map(Result::transpose)
@@ -246,10 +265,9 @@ impl Stream for IndexRows {
 }
 
 impl Stream for CompactionIndexInterleaver {
-    type Item = (usize, IndexRow);
+    type Item = Result<(usize, IndexRow), Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        fixme("do we need to handle errors from the inner streams?");
         self.poll_next_row(cx)
     }
 }
@@ -326,6 +344,7 @@ mod tests {
         let mut stream = IndexRows {
             reader,
             internal_buf: vec![],
+            has_errored: false,
         };
 
         loop {

@@ -149,6 +149,8 @@ async fn test_table_with_compaction() {
         assert_eq!(real_data, expected_data, "data mismatch on key {key}");
     }
 
+    table_2_sender.send(Event::PrintSelf).await.unwrap();
+
     table_2_sender.send(Event::Shutdown).await.unwrap();
     match table_2_handle.await.unwrap() {
         Ok(_) | Err(Error::OkShutdown) => {

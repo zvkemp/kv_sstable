@@ -1,4 +1,5 @@
 use std::{
+    fmt::Debug,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -14,14 +15,14 @@ use tokio::{
     task::JoinHandle,
     time::Instant,
 };
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 use tracing::{debug, info};
 
 use crate::{
     error::Error,
     fixme, fixme_msg,
     sstable::{
-        index::{CompactionIndexInterleaver, IndexRow, IndexRows},
+        index::{CompactionIndexInterleaver, DynIndexStream, IndexRow, IndexRows},
         MemTable, SSTable,
     },
 };
@@ -39,6 +40,7 @@ pub struct Table {
     compaction_task: Option<JoinHandle<Result<(), Error>>>,
     compaction_count: usize,
     writable: bool,
+    live_streams: Vec<JoinHandle<()>>,
 }
 
 // Table should be able to provide access to data in the following order:
@@ -46,7 +48,6 @@ pub struct Table {
 // - previous memtable (current being persisted to disk)
 // - sstables in order from newest to oldest
 
-#[derive(Debug)]
 pub enum Event {
     Get {
         key: String,
@@ -78,6 +79,15 @@ pub enum Event {
     },
     CompactionFinished(SSTable, Vec<SSTable>),
     DropTable,
+    PrintSelf,
+    ListKeys {
+        reply_to: ReplyToListKeys,
+        newer_than: Option<Duration>,
+    },
+    StreamAll {
+        reply_to: Sender<StreamData>,
+        newer_than: Option<Duration>,
+    },
 }
 
 pub enum Reply {
@@ -85,8 +95,93 @@ pub enum Reply {
     Empty,
 }
 
+pub enum StreamData {
+    Data(String, Duration, Bytes),
+    Done,
+}
+
+impl std::fmt::Debug for StreamData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Data(key, timestamp, _data) => f
+                .debug_tuple("Data")
+                .field(key)
+                .field(timestamp)
+                .field(&"Bytes<...>")
+                .finish(),
+            Self::Done => write!(f, "Done"),
+        }
+    }
+}
+
+impl Debug for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Get { key, reply_to } => f
+                .debug_struct("Get")
+                .field("key", key)
+                .field("reply_to", reply_to)
+                .finish(),
+            Self::Put {
+                key,
+                data,
+                timestamp,
+                reply_to,
+            } => f
+                .debug_struct("Put")
+                .field("key", key)
+                .field("data", data)
+                .field("timestamp", timestamp)
+                .field("reply_to", reply_to)
+                .finish(),
+            Self::MemTableFlushed(arg0) => f.debug_tuple("MemTableFlushed").field(arg0).finish(),
+            Self::Tick => write!(f, "Tick"),
+            Self::Shutdown => write!(f, "Shutdown"),
+            Self::ShutdownFinished => write!(f, "ShutdownFinished"),
+            Self::CompactGen {
+                generation,
+                threshold,
+            } => f
+                .debug_struct("CompactGen")
+                .field("generation", generation)
+                .field("threshold", threshold)
+                .finish(),
+            Self::Compact { threshold } => f
+                .debug_struct("Compact")
+                .field("threshold", threshold)
+                .finish(),
+            Self::CompactionFinished(arg0, arg1) => f
+                .debug_tuple("CompactionFinished")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
+            Self::DropTable => write!(f, "DropTable"),
+            Self::PrintSelf => write!(f, "PrintSelf"),
+            Self::ListKeys {
+                reply_to,
+                newer_than,
+            } => f
+                .debug_struct("ListKeys")
+                .field("reply_to", &"Sender<...>")
+                .field("newer_than", newer_than)
+                .finish(),
+            Self::StreamAll {
+                reply_to,
+                newer_than,
+            } => f
+                .debug_struct("StreamAll")
+                .field("reply_to", &"Sender<...>")
+                .field("newer_than", newer_than)
+                .finish(),
+        }
+    }
+}
+
 pub type ReplyToGet = oneshot::Sender<Result<(Duration, Bytes), Error>>;
 pub type EmptyReplyTo = oneshot::Sender<Result<(), Error>>;
+pub type ReplyToListKeys = oneshot::Sender<Result<ListKeysStream, Error>>;
+
+pub type ListKeysStream = Pin<Box<dyn Stream<Item = Result<IndexRow, Error>> + Send>>;
 
 pub type TableSender = Sender<Event>;
 pub type TableHandle = JoinHandle<Result<(), Error>>;
@@ -183,7 +278,10 @@ impl Table {
         };
 
         for path in sstable_paths {
-            sstables.push(SSTable::from_dir(&path).await);
+            fixme("we might have 'dangling' indexes and summaries, which should stick around until streams have finished.");
+            if path.join("sstable").is_file() {
+                sstables.push(SSTable::from_dir(&path).await);
+            }
         }
 
         sstables.sort_by_key(|a| a.uuid_string());
@@ -210,6 +308,7 @@ impl Table {
             compaction_task: None,
             compaction_count: 0,
             writable,
+            live_streams: vec![],
         })
     }
 
@@ -217,16 +316,69 @@ impl Table {
         Self::new_inner(path, memtable_size_limit, true).await
     }
 
-    pub async fn list_keys(&self) -> Pin<Box<dyn Stream<Item = (usize, IndexRow)>>> {
+    /// This uses the Compaction index interleaver to list keys in alphabetical order,
+    /// omitting duplicates (newest timestamp wins)
+    pub async fn list_keys(&self, newer_than: Option<Duration>) -> ListKeysStream {
+        let newer_than = newer_than.unwrap_or_default();
+
         let mut streams = vec![];
+        // This is not ideal, but we should be ignoring everything but the keys.
+        fn memtable_to_stream(memtable: &MemTable) -> DynIndexStream {
+            let mut rows = vec![];
+            memtable.data.iter().for_each(|(key, (ts, _value))| {
+                rows.push(IndexRow {
+                    key: key.clone(),
+                    timestamp: *ts,
+                    start: 0,
+                    len: 0,
+                })
+            });
+
+            rows.sort_by(|a, b| a.key.cmp(&b.key));
+
+            Box::new(tokio_stream::iter(rows.into_iter().map(Ok)))
+        }
+
+        streams.push(memtable_to_stream(&self.live_memtable));
+        if let Some(previous_memtable) = self.previous_memtable.as_ref() {
+            streams.push(memtable_to_stream(previous_memtable));
+        }
 
         for generation in self.sstables.inner.iter() {
             for sstable in generation.iter() {
-                streams.push(IndexRows::from_path(sstable.index_path()).await)
+                if sstable.max_timestamp() >= &newer_than {
+                    streams.push(Box::new(IndexRows::from_path(sstable.index_path()).await)
+                        as DynIndexStream);
+                }
             }
         }
 
-        Box::pin(CompactionIndexInterleaver::new_from_streams(streams))
+        let interleaver = CompactionIndexInterleaver::new_from_streams(streams);
+
+        Box::pin(interleaver.filter_map(move |res| match res {
+            Ok((_, index_row)) => {
+                if index_row.timestamp > newer_than {
+                    Some(Ok(index_row))
+                } else {
+                    None
+                }
+            }
+            Err(e) => Some(Err(e)),
+        }))
+    }
+
+    pub fn list_component_tables(&self) {
+        fixme("list live keys");
+
+        println!("Table {:?}", self.path);
+        for (g, generation) in self.sstables.inner.iter().enumerate() {
+            println!("Generation {g}\n=============================");
+            for (t, table) in generation.iter().enumerate() {
+                println!("{t} {}", table.uuid());
+                println!("  {}..{}", table.first_key(), table.last_key());
+                println!("  {:?}..{:?}", table.min_timestamp(), table.max_timestamp());
+            }
+        }
     }
 
     async fn tick(&mut self) -> Result<(), Error> {
@@ -237,12 +389,15 @@ impl Table {
             self.sync_write_log().await?;
         }
 
+        self.live_streams.retain(|t| !t.is_finished());
         self.sender
             .as_ref()
             .unwrap()
             .send(Event::Compact { threshold: 5 })
             .await
             .unwrap();
+
+        fixme("clean up dangling indexes if streams is empty");
 
         Ok(())
     }
@@ -351,6 +506,65 @@ impl Table {
 
             // This should be the last event in the channel.
             Some(Event::ShutdownFinished) => Err(Error::OkShutdown),
+            Some(Event::PrintSelf) => {
+                self.list_component_tables();
+                Ok(())
+            }
+            Some(Event::ListKeys {
+                reply_to,
+                newer_than,
+            }) => {
+                todo!("maybe remove me");
+                let stream = self.list_keys(newer_than).await;
+                let _ = reply_to.send(Ok(stream));
+
+                Ok(())
+            }
+            Some(Event::StreamAll {
+                reply_to,
+                newer_than,
+            }) => {
+                // This basically snapshots the table at this point in time, then iterates over the keys, returning the data
+                // This should return the newest data for any particular key, but not necessary any keys that were new after the stream started.
+                // Run it a second time to get the newer keys!
+                let mut key_stream = self.list_keys(newer_than).await;
+                let sender = self.sender.clone().unwrap();
+                let task = tokio::spawn(async move {
+                    while let Some(index_row_res) = key_stream.next().await {
+                        match index_row_res {
+                            Ok(index_row) => {
+                                let (tx, rx) = oneshot::channel();
+                                let _ = sender
+                                    .send(Event::Get {
+                                        key: index_row.key.clone(),
+                                        reply_to: tx,
+                                    })
+                                    .await;
+
+                                match rx.await.unwrap() {
+                                    Ok((duration, bytes)) => {
+                                        reply_to
+                                            .send(StreamData::Data(index_row.key, duration, bytes))
+                                            .await
+                                            .expect("something wrong with the data stream channel");
+                                    }
+                                    Err(e) => todo!("{e:?}"),
+                                }
+                            }
+                            Err(_) => todo!(),
+                        }
+                    }
+
+                    // If the stream ends without this terminator, then whoops. We probably had an error internally.
+                    reply_to.send(StreamData::Done).await.unwrap();
+
+                    drop(reply_to)
+                });
+
+                self.live_streams.push(task);
+
+                Ok(())
+            }
             None => Err(Error::Closed),
         }
     }
@@ -569,6 +783,7 @@ impl Table {
 }
 
 // Just a vec of vecs, sstables sorted into their generation ids. Newer generations are lower.
+// FIXME: do we need to track timestamp/key ranges?
 #[derive(Default)]
 struct GenerationalSSTables {
     inner: Vec<Vec<SSTable>>,
