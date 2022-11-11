@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use dwkv::error::Error;
-use dwkv::table::{Event, Table};
+use dwkv::table::{Event, Table, TableOptions};
 use rand::seq::SliceRandom;
 use std::sync::Arc;
 use std::{collections::HashMap, time::Duration};
@@ -17,20 +17,25 @@ async fn test_table_with_compaction() {
         std::process::exit(1);
     }));
 
-    let mb = 8;
+    let mb = 2;
 
     let tempdir = TempDir::new("test_dwkv_table").unwrap();
     let table_path = tempdir.path().join("table_1_test");
 
     tracing::info!("spawning table 1");
-    let table_1 = Table::new(&table_path, mb * 1024 * 1024).await.unwrap();
+    let table_options = TableOptions {
+        missing_table_behavior: dwkv::table::MissingTableBehavior::Create,
+        writable: true,
+        memtable_size_limit: mb * 1024 * 1024,
+    };
+    let table_1 = Table::new(&table_path, table_options).await.unwrap();
 
     let (table_1_sender, table_1_handle) = table_1.spawn().unwrap();
 
     let key_tracker = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
 
-    let put_count = 25000;
-    let unique_key_count = 6000;
+    let put_count = 5000;
+    let unique_key_count = 500;
     let mut all_keys = (0..unique_key_count)
         .map(|i| format!("key/for/{i:0>6}"))
         .cycle()
@@ -69,8 +74,8 @@ async fn test_table_with_compaction() {
 
     // Checks that if we start a new table at the same path, the data is parseable.
     // FIXME: also check that the write log works in case of a non-clean shutdown.
-    let table_2 = Table::new(&table_path, mb * 1024 * 1024).await.unwrap();
-    let table_3 = Table::new(&table_path.with_file_name("replica"), mb * 1024 * 1024)
+    let table_2 = Table::new(&table_path, table_options).await.unwrap();
+    let table_3 = Table::new(&table_path.with_file_name("replica"), table_options)
         .await
         .unwrap();
 

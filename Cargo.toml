@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "dwkv-cli"
 path = "src/bin/cli.rs"
 
+[[bin]]
+name = "dump_write_log"
+path = "src/bin/dump_write_log.rs"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]

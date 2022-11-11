@@ -194,7 +194,11 @@ pin_project! {
 
 impl IndexRows {
     pub(crate) async fn from_path(index_path: impl AsRef<Path>) -> Self {
-        let reader = BufReader::new(tokio::fs::File::open(index_path.as_ref()).await.unwrap());
+        let reader = BufReader::new(
+            tokio::fs::File::open(index_path.as_ref())
+                .await
+                .expect("IndexRows::from_path: index_path {index_path:?} not found"),
+        );
         IndexRows {
             reader,
             internal_buf: Vec::new(),

@@ -1,9 +1,11 @@
 use std::{
+    cmp::Ordering,
     fmt::Debug,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
     time::Duration,
+    vec::Drain,
 };
 
 use bytes::Bytes;
@@ -41,6 +43,20 @@ pub struct Table {
     compaction_count: usize,
     writable: bool,
     live_streams: Vec<JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for Table {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Table")
+            .field("path", &self.path)
+            .field("memtable_size_limit", &self.memtable_size_limit)
+            .field("is_shutting_down", &self.is_shutting_down)
+            .field("compaction_count", &self.compaction_count)
+            .field("writable", &self.writable)
+            .field("live_streams", &self.live_streams)
+            .field("", &"...")
+            .finish()
+    }
 }
 
 // Table should be able to provide access to data in the following order:
@@ -187,6 +203,29 @@ pub type TableSender = Sender<Event>;
 pub type TableHandle = JoinHandle<Result<(), Error>>;
 pub type TableSpawn = (TableSender, TableHandle);
 
+#[derive(Debug, Copy, Clone)]
+pub enum MissingTableBehavior {
+    Create,
+    Error,
+}
+
+#[derive(Copy, Debug, Clone)]
+pub struct TableOptions {
+    pub missing_table_behavior: MissingTableBehavior,
+    pub writable: bool,
+    pub memtable_size_limit: usize,
+}
+
+impl Default for TableOptions {
+    fn default() -> Self {
+        Self {
+            missing_table_behavior: MissingTableBehavior::Create,
+            writable: true,
+            memtable_size_limit: 8 * 1024 * 1024,
+        }
+    }
+}
+
 impl Table {
     // each live table runs an event loop
     async fn run(mut self, mut receiver: Receiver<Event>) -> Result<(), Error> {
@@ -214,6 +253,7 @@ impl Table {
         Ok((sender, handle))
     }
 
+    #[deprecated = "what is the reason for this?"]
     pub async fn readonly(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
         if !path.is_dir() {
@@ -222,18 +262,28 @@ impl Table {
             });
         }
 
-        Self::new_inner(path, 0, false).await
+        Self::new_inner(
+            path,
+            TableOptions {
+                missing_table_behavior: MissingTableBehavior::Error,
+                writable: false,
+                memtable_size_limit: 0,
+            },
+        )
+        .await
     }
 
     // FIXME: pub makes no sense, but sometimes we want to expose writable
-    pub async fn new_inner(
-        path: impl AsRef<Path>,
-        memtable_size_limit: usize,
-        writable: bool,
-    ) -> Result<Self, Error> {
-        tokio::fs::create_dir_all(&path).await.unwrap();
+    pub async fn new_inner(path: impl AsRef<Path>, options: TableOptions) -> Result<Self, Error> {
+        if matches!(options.missing_table_behavior, MissingTableBehavior::Error) {
+            if !path.as_ref().is_dir() {
+                return Err(Error::TableDoesNotExist);
+            }
+        }
 
-        let mut entries = tokio::fs::read_dir(&path).await.unwrap();
+        tokio::fs::create_dir_all(&path).await?;
+
+        let mut entries = tokio::fs::read_dir(&path).await?;
         let mut write_logs: Vec<PathBuf> = vec![];
         let mut sstable_paths: Vec<PathBuf> = vec![];
         loop {
@@ -270,12 +320,9 @@ impl Table {
         tracing::debug!("found sstables: {:?}", sstable_paths);
         println!("found sstables: {:?}", sstable_paths);
 
-        fixme("if we just load logs into the 'live' memtable instead, we can avoid branching for readonly tables");
-        let mut sstables = if writable {
-            dbg!(MemTable::recover_write_logs(write_logs).await)?
-        } else {
-            vec![]
-        };
+        let mut recovered_memtable =
+            MemTable::recover_write_logs(path.as_ref(), write_logs).await?;
+        let mut sstables = vec![];
 
         for path in sstable_paths {
             fixme("we might have 'dangling' indexes and summaries, which should stick around until streams have finished.");
@@ -295,25 +342,29 @@ impl Table {
             generational_sstables.push(sstable);
         }
 
+        if !options.writable {
+            recovered_memtable.close_write_log().await?;
+        }
+
         Ok(Table {
             path: path.as_ref().to_owned(),
-            live_memtable: MemTable::new(writable.then_some(path.as_ref())).await?,
+            live_memtable: recovered_memtable,
             previous_memtable: None,
             sstables: generational_sstables,
-            memtable_size_limit,
+            memtable_size_limit: options.memtable_size_limit,
             sender: None,
             flush_semaphore: Arc::new(Semaphore::new(1)),
             flush_handle: None,
             is_shutting_down: false,
             compaction_task: None,
             compaction_count: 0,
-            writable,
+            writable: options.writable,
             live_streams: vec![],
         })
     }
 
-    pub async fn new(path: impl AsRef<Path>, memtable_size_limit: usize) -> Result<Self, Error> {
-        Self::new_inner(path, memtable_size_limit, true).await
+    pub async fn new(path: impl AsRef<Path>, options: TableOptions) -> Result<Self, Error> {
+        Self::new_inner(path, options).await
     }
 
     /// This uses the Compaction index interleaver to list keys in alphabetical order,
@@ -345,7 +396,7 @@ impl Table {
         }
 
         for generation in self.sstables.inner.iter() {
-            for sstable in generation.iter() {
+            for sstable in generation.inner.iter() {
                 if sstable.max_timestamp() >= &newer_than {
                     streams.push(Box::new(IndexRows::from_path(sstable.index_path()).await)
                         as DynIndexStream);
@@ -373,7 +424,7 @@ impl Table {
         println!("Table {:?}", self.path);
         for (g, generation) in self.sstables.inner.iter().enumerate() {
             println!("Generation {g}\n=============================");
-            for (t, table) in generation.iter().enumerate() {
+            for (t, table) in generation.inner.iter().enumerate() {
                 println!("{t} {}", table.uuid());
                 println!("  {}..{}", table.first_key(), table.last_key());
                 println!("  {:?}..{:?}", table.min_timestamp(), table.max_timestamp());
@@ -448,6 +499,8 @@ impl Table {
     async fn handle_event(&mut self, event: Option<Event>) -> Result<(), Error> {
         // Any errors that bubble up to this point will cause the event loop to exit.
         // Please send client-type errors back through the channel, or log them as needed.
+        fixme("passing reply_to to the handlers is error prone; we should be allowed to `return` from those methods");
+        fixme("without dropping the sender");
         match event {
             Some(Event::Get { key, reply_to }) => self.handle_get(key, reply_to).await,
             Some(Event::Put {
@@ -477,7 +530,11 @@ impl Table {
             Some(Event::Compact { threshold }) => self.compact(threshold).await,
             Some(Event::CompactionFinished(new_sstable, old_sstables)) => {
                 tracing::info!("Compaction finished; new_sstable = {new_sstable:?}");
-                self.finalize_compaction(new_sstable, old_sstables).await
+                if let Err(e) = self.finalize_compaction(new_sstable, old_sstables).await {
+                    tracing::error!("Error finalizing compaction: {e:?}");
+                }
+
+                Ok(())
             }
             Some(Event::Shutdown) => {
                 self.shutdown().await?;
@@ -529,6 +586,7 @@ impl Table {
                 // Run it a second time to get the newer keys!
                 let mut key_stream = self.list_keys(newer_than).await;
                 let sender = self.sender.clone().unwrap();
+                let self_debug = format!("{:?}", self);
                 let task = tokio::spawn(async move {
                     while let Some(index_row_res) = key_stream.next().await {
                         match index_row_res {
@@ -541,14 +599,21 @@ impl Table {
                                     })
                                     .await;
 
-                                match rx.await.unwrap() {
-                                    Ok((duration, bytes)) => {
+                                match rx.await {
+                                    Ok(Ok((duration, bytes))) => {
                                         reply_to
                                             .send(StreamData::Data(index_row.key, duration, bytes))
                                             .await
                                             .expect("something wrong with the data stream channel");
                                     }
-                                    Err(e) => todo!("{e:?}"),
+
+                                    Ok(Err(e)) => todo!("Error in table {e:?}"),
+                                    Err(e) => {
+                                        todo!(
+                                            "RecvError waiting for response from table {e:?}; {:?}",
+                                            self_debug
+                                        )
+                                    }
                                 }
                             }
                             Err(_) => todo!(),
@@ -637,8 +702,6 @@ impl Table {
         self.is_shutting_down = true;
         self.flush_live_memtable(true).await?;
 
-        dbg!(&self.path);
-
         if let Some(task) = self.compaction_task.take() {
             tracing::warn!("awaiting live compaction...");
             // FIXME: clean up compaction
@@ -653,28 +716,36 @@ impl Table {
             fixme("allow compaction to be cancelled");
         }
 
-        let _ = fixme_msg(dbg!(self.sstables.decommission().await), "handle error");
+        let _ = fixme_msg(self.sstables.decommission().await, "handle error");
 
+        tracing::warn!("DROP DATA @ {:?}", self.path);
         tokio::fs::remove_dir_all(&self.path).await?;
 
         Ok(())
     }
 
     async fn handle_get(&mut self, key: String, reply_to: ReplyToGet) -> Result<(), Error> {
-        fixme("is it always correct to short-circuit if data was found in the live table? NO");
-
         tracing::debug!("TABLE::get[{key}]");
-        let response = if let Some((ts, bytes)) = self.live_memtable.get(&key).cloned() {
-            Ok((ts, bytes))
-        } else if let Some((ts, bytes)) = self
+
+        // Live memtable is likely to have the most recent data, but it won't always.
+        let mut found = self.live_memtable.get(&key).cloned();
+        // Also check previous memtable
+        if let Some(also_found) = self
             .previous_memtable
             .as_ref()
             .and_then(|prev| prev.get(&key).cloned())
         {
-            Ok((ts, bytes))
-        } else {
-            self.find_in_sstables(key.as_str()).await
-        };
+            swap_compare(&mut found, also_found);
+        }
+
+        // Also check sstables
+        if let Err(e) = self.find_in_sstables(key.as_str(), &mut found).await {
+            // Reply with any errors found checking the sstables.
+            let _ = reply_to.send(Err(e));
+            return Ok(());
+        }
+
+        let response = found.ok_or_else(|| Error::DataNotFound { key });
 
         if let Err(_e) = reply_to.send(response) {
             tracing::error!("error sending reply to oneshot channel");
@@ -683,8 +754,12 @@ impl Table {
         Ok(())
     }
 
-    async fn find_in_sstables(&mut self, key: &str) -> Result<(Duration, Bytes), Error> {
-        self.sstables.find(key).await
+    async fn find_in_sstables(
+        &mut self,
+        key: &str,
+        already_found: &mut Option<(Duration, Bytes)>,
+    ) -> Result<(), Error> {
+        self.sstables.find_compare(key, already_found).await
     }
 
     async fn handle_put(
@@ -701,10 +776,10 @@ impl Table {
         } else {
             if let Some(found_ts) = self.find_greater_timestamp_for_key(&key, &timestamp).await {
                 tracing::warn!("Ignoring late-arriving key={key}@{timestamp:?}");
-                return Ok(());
+                Ok(())
+            } else {
+                self.live_memtable.insert(key, timestamp, data).await
             }
-
-            self.live_memtable.insert(key, timestamp, data).await
         };
         // println!("sending reply");
         let _ = reply_to.send(res);
@@ -747,15 +822,23 @@ impl Table {
 
             drop(removed);
 
-            old_sstable.decommission().await.unwrap();
+            old_sstable.decommission().await?;
         }
 
-        self.compaction_task
-            .take()
-            .expect("compaction task should have been here")
-            .await
-            .unwrap()
-            .unwrap();
+        if self.compaction_task.is_none() {
+            tracing::debug!("{:#?}", self);
+        }
+
+        if self.compaction_task.is_some() {
+            self.compaction_task
+                .take()
+                .expect("compaction task should have been here")
+                .await
+                .unwrap()
+                .unwrap();
+        } else if !self.is_shutting_down {
+            panic!("compaction task was missing during a non-shutdown scenario");
+        }
 
         Ok(())
     }
@@ -786,13 +869,116 @@ impl Table {
 // FIXME: do we need to track timestamp/key ranges?
 #[derive(Default)]
 struct GenerationalSSTables {
-    inner: Vec<Vec<SSTable>>,
+    inner: Vec<Generation>,
+}
+
+#[derive(Debug)]
+pub(crate) struct KeyRange {
+    pub(crate) first_key: String,
+    pub(crate) last_key: String,
+    pub(crate) min_timestamp: Duration,
+    pub(crate) max_timestamp: Duration,
+}
+impl KeyRange {
+    fn merge_sstable(&mut self, sstable: &SSTable) {
+        if sstable.first_key() < self.first_key.as_str() {
+            self.first_key = sstable.first_key().to_owned();
+        }
+
+        if sstable.last_key() > self.last_key.as_str() {
+            self.last_key = sstable.last_key().to_owned();
+        }
+
+        if sstable.min_timestamp() < &self.min_timestamp {
+            self.min_timestamp = *sstable.min_timestamp()
+        }
+
+        if sstable.max_timestamp() > &self.max_timestamp {
+            self.max_timestamp = *sstable.max_timestamp()
+        }
+    }
+
+    fn covers_key(&self, key: &str) -> bool {
+        key >= self.first_key.as_str() && key <= self.last_key.as_str()
+    }
+
+    fn covers_timestamp(&self, ts: &Duration) -> bool {
+        ts >= &self.min_timestamp && ts <= &self.max_timestamp
+    }
+
+    fn covers_newer_timestamp(&self, ts: Option<&Duration>) -> bool {
+        match ts {
+            None => true,
+            Some(inner) => inner <= &self.max_timestamp,
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+struct Generation {
+    inner: Vec<SSTable>,
+    key_range: Option<KeyRange>,
+}
+
+impl Generation {
+    fn push(&mut self, sstable: SSTable) {
+        if self.key_range.is_none() {
+            self.key_range = Some(sstable.key_range());
+        } else {
+            self.key_range.as_mut().map(|key_range| {
+                key_range.merge_sstable(&sstable);
+            });
+        }
+
+        self.inner.push(sstable);
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn as_slice(&self) -> &[SSTable] {
+        self.inner.as_slice()
+    }
+
+    fn remove(&mut self, index: usize) -> SSTable {
+        self.inner.remove(index)
+    }
+
+    fn iter_mut(&mut self) -> std::slice::IterMut<SSTable> {
+        self.inner.iter_mut()
+    }
+
+    fn drain(&mut self, arg: std::ops::RangeFrom<usize>) -> Drain<SSTable> {
+        self.inner.drain(arg)
+    }
+
+    fn covers_key(&self, key: &str) -> bool {
+        self.key_range
+            .as_ref()
+            .map(|key_range| key_range.covers_key(key))
+            .unwrap_or_default()
+    }
+
+    fn covers_timestamp(&self, timestamp: &Duration) -> bool {
+        self.key_range
+            .as_ref()
+            .map(|key_range| key_range.covers_timestamp(timestamp))
+            .unwrap_or_default()
+    }
+
+    fn covers_newer_timestamp(&self, timestamp: Option<&Duration>) -> bool {
+        self.key_range
+            .as_ref()
+            .map(|key_range| key_range.covers_newer_timestamp(timestamp))
+            .unwrap_or_default()
+    }
 }
 
 impl GenerationalSSTables {
     fn push(&mut self, sstable: SSTable) {
         while self.inner.len() < sstable.generation() + 1 {
-            self.inner.push(vec![]);
+            self.inner.push(Default::default());
         }
 
         fixme("check ordering on these; it's error-prone to have to rev the sstable iterator");
@@ -813,23 +999,41 @@ impl GenerationalSSTables {
             .remove(0)
     }
 
+    /// Find a key/value in these sstables.
     async fn find(&mut self, key: &str) -> Result<(Duration, Bytes), Error> {
-        fixme("this isn't quite correct - need to find all sstables where the key is in range, then compare the results by timestamp");
+        let mut found = None;
+        self.find_compare(&key, &mut found).await?;
+        found.ok_or_else(|| Error::DataNotFound { key: key.into() })
+    }
+
+    /// Find a key/value in these sstables, with maybe an already-fetched result to compare.
+    async fn find_compare(
+        &mut self,
+        key: &str,
+        found: &mut Option<(Duration, Bytes)>,
+    ) -> Result<(), Error> {
         // what assumptions can we make about generational residency?
-        fixme("track key ranges (max/min) on the generations");
+        fixme("add a bloom filter to the sstable summary");
+        fixme("https://github.com/ayazhafiz/xorf");
         for generation in self.inner.iter_mut() {
-            for sstable in generation.iter_mut().rev() {
-                match sstable.get(key).await {
-                    Ok(res) => {
-                        return Ok(res);
+            if generation.covers_key(key)
+                && generation.covers_newer_timestamp(found.as_ref().map(|x| &x.0))
+            {
+                for sstable in generation.iter_mut() {
+                    match sstable.get(key).await {
+                        Ok(res) => {
+                            swap_compare(found, res);
+                        }
+                        Err(Error::KeyNotInRange) | Err(Error::DataNotFound { .. }) => {}
+                        Err(e) => Err(e)?,
                     }
-                    Err(Error::KeyNotInRange) | Err(Error::DataNotFound { .. }) => {}
-                    Err(e) => Err(e)?,
                 }
             }
         }
-        // FIXME: at this point should we detach to a task?
-        Err(Error::DataNotFound { key: key.into() })
+
+        Ok(())
+
+        // found.ok_or_else(|| Error::DataNotFound { key: key.into() })
     }
 
     fn length_of(&self, gen: usize) -> usize {
@@ -868,14 +1072,168 @@ impl GenerationalSSTables {
 
         None
     }
+
+    #[deprecated = "probably not worth having, as we need to re-heck on the generations anyway"]
+    fn covers_key(&self, key: &str) -> bool {
+        self.inner
+            .iter()
+            .any(|generation| generation.covers_key(key))
+    }
+
+    fn covers_timestamp(&self, timestamp: &Duration) -> bool {
+        self.inner
+            .iter()
+            .any(|generation| generation.covers_timestamp(timestamp))
+    }
+
+    fn covers_newer_timestamp(&self, timestamp: Option<&Duration>) -> bool {
+        self.inner
+            .iter()
+            .any(|generation| generation.covers_newer_timestamp(timestamp))
+    }
+}
+
+fn swap_compare(a: &mut Option<(Duration, Bytes)>, b: (Duration, Bytes)) {
+    match a {
+        Some((ts, _)) => {
+            if b.0 >= *ts {
+                *a = Some(b);
+            }
+        }
+        None => {
+            *a = Some(b);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Table;
+    use std::{collections::HashMap, iter::successors, time::Duration};
+
+    use crate::sstable::{test_helpers::make_key, SSTable};
+
+    use super::{GenerationalSSTables, Table};
 
     #[tokio::test]
     async fn test_table_1() {
-        let table = Table::new("unified_reports/1000", 1000);
+        let table = Table::new(
+            "unified_reports/1000",
+            super::TableOptions {
+                missing_table_behavior: super::MissingTableBehavior::Create,
+                writable: true,
+                memtable_size_limit: 1000,
+            },
+        );
+    }
+
+    fn timestamps_iter(start: Duration, step: Duration) -> impl Iterator<Item = Duration> {
+        successors(Some(start), move |n| n.checked_add(step))
+    }
+
+    fn timestamps_by_sec(ts: u64) -> impl Iterator<Item = Duration> {
+        timestamps_iter(Duration::from_secs(ts), Duration::from_secs(1))
+    }
+
+    #[tokio::test]
+    async fn test_generations() {
+        use tempdir::TempDir;
+
+        use crate::sstable::test_helpers;
+
+        let tmpdir = TempDir::new("test_generations").unwrap();
+
+        let mut generations = GenerationalSSTables::default();
+        let timestamps = timestamps_iter(Duration::from_secs(1668185000), Duration::from_secs(1));
+
+        let (sstable_0, inserts_0) = test_helpers::build_test_sstable(
+            0,
+            tmpdir.path(),
+            20..30,
+            timestamps_by_sec(1668185010),
+        )
+        .await;
+        let (sstable_1, inserts_1) = test_helpers::build_test_sstable(
+            1,
+            tmpdir.path(),
+            5..25,
+            timestamps_by_sec(1668185002),
+        )
+        .await;
+        let (sstable_1_1, inserts_1_1) = test_helpers::build_test_sstable(
+            1,
+            tmpdir.path(),
+            0..20,
+            timestamps_by_sec(1668185001),
+        )
+        .await;
+        let (sstable_2, inserts_2) = test_helpers::build_test_sstable(
+            2,
+            tmpdir.path(),
+            0..15,
+            timestamps_by_sec(1668185000),
+        )
+        .await;
+
+        fn track_max_timestamps(
+            map: &mut HashMap<String, Duration>,
+            data: Vec<(String, Duration)>,
+        ) {
+            for (key, ts) in data {
+                let entry = map.entry(key).or_insert(ts);
+                if ts > *entry {
+                    *entry = ts
+                }
+            }
+        }
+
+        let mut max_timestamp_by_key = HashMap::new();
+
+        // generations.push(sstable_2);
+        let key_000001 = make_key(1);
+        assert!(
+            !generations.covers_key(key_000001.as_str()),
+            "empty table covers nothing"
+        );
+        assert!(
+            !generations.covers_timestamp(&Duration::from_secs(1668185001)),
+            "empty table covers nothing"
+        );
+
+        async fn assert_data(
+            generations: &mut GenerationalSSTables,
+            keys: &HashMap<String, Duration>,
+        ) {
+            for (key, expected_ts) in keys.iter() {
+                let (actual_ts, _data) = generations.find(key).await.unwrap();
+
+                println!("{key} @ {actual_ts:?} {_data:?}");
+                assert_eq!(actual_ts, *expected_ts, "timestamps differed for key={key}, actual={actual_ts:?}, expected={expected_ts:?}");
+            }
+        }
+
+        generations.push(sstable_2);
+        track_max_timestamps(&mut max_timestamp_by_key, inserts_2);
+        assert_data(&mut generations, &max_timestamp_by_key).await;
+        assert!(generations.covers_key(key_000001.as_str()),);
+        assert!(generations.covers_timestamp(&Duration::from_secs(1668185001)),);
+        assert!(!generations.covers_key(&make_key(19)));
+
+        generations.push(sstable_1_1);
+        track_max_timestamps(&mut max_timestamp_by_key, inserts_1_1);
+        assert_data(&mut generations, &max_timestamp_by_key).await;
+        assert!(generations.covers_key(key_000001.as_str()));
+        assert!(generations.covers_key(&make_key(19)));
+        assert!(generations.covers_timestamp(&Duration::from_secs(1668185020)),);
+        assert!(!generations.covers_timestamp(&Duration::from_secs(1668185021)),);
+
+        generations.push(sstable_1);
+        track_max_timestamps(&mut max_timestamp_by_key, inserts_1);
+        assert_data(&mut generations, &max_timestamp_by_key).await;
+        assert!(generations.covers_timestamp(&Duration::from_secs(1668185021)),);
+        assert!(generations.covers_key(&make_key(24)));
+
+        generations.push(sstable_0);
+        track_max_timestamps(&mut max_timestamp_by_key, inserts_0);
+        assert_data(&mut generations, &max_timestamp_by_key).await;
     }
 }

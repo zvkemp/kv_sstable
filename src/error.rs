@@ -1,4 +1,4 @@
-use std::{fmt::Display, io, path::PathBuf};
+use std::{fmt::Display, io, path::PathBuf, time::Duration};
 
 #[derive(Debug)]
 pub enum Error {
@@ -15,11 +15,21 @@ pub enum Error {
     SSTableAlreadyExists { path: PathBuf },
     NoDataWasWritten,
     InvalidUuid { input: String },
-    InvalidChecksum,
+    InvalidChecksum { key: String, table_path: String },
+    InvalidKey,
+    TableDoesNotExist,
+    UnexpectedEOF { source: Option<io::Error> },
+    WriteLogEOF,
 }
 
 impl From<io::Error> for Error {
     fn from(source: io::Error) -> Self {
+        if source.kind() == io::ErrorKind::UnexpectedEof {
+            return Self::UnexpectedEOF {
+                source: Some(source),
+            };
+        }
+
         Self::Io { source }
     }
 }

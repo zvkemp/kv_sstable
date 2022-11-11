@@ -25,6 +25,7 @@ use crate::{
     error::Error,
     fixme, fixme_msg,
     sstable::index::{CompactionIndexInterleaver, DynIndexStream, IndexRows},
+    table::KeyRange,
 };
 
 pub(crate) mod data;
@@ -104,6 +105,15 @@ impl SSTable {
 
     pub(crate) fn generation(&self) -> usize {
         self.uuid().generation
+    }
+
+    pub(crate) fn key_range(&self) -> KeyRange {
+        KeyRange {
+            first_key: self.first_key().to_owned(),
+            last_key: self.last_key().to_owned(),
+            min_timestamp: *self.min_timestamp(),
+            max_timestamp: *self.max_timestamp(),
+        }
     }
 
     pub(crate) fn index_path(&self) -> PathBuf {
@@ -303,20 +313,14 @@ impl MemTable {
     }
 
     pub(crate) async fn recover_write_logs(
+        path: &Path,
         write_logs: Vec<PathBuf>,
-    ) -> Result<Vec<SSTable>, Error> {
-        let mut sstables = vec![];
+    ) -> Result<MemTable, Error> {
+        // This combines found write logs into a new log.
+        let mut new_table = MemTable::new(Some(path)).await?;
 
         for write_log in write_logs {
             let uuid = write_log.file_stem().unwrap().to_string_lossy();
-
-            let mut memtable = MemTable {
-                data: Default::default(),
-                uuid: uuid.parse()?,
-                write_log: None,
-                memsize: 0,
-                last_insert_at: Instant::now(),
-            };
 
             let file = tokio::fs::File::open(&write_log).await?;
             let mut reader = BufReader::new(file);
@@ -325,38 +329,87 @@ impl MemTable {
                 // could have stopped writing anywhere in a non-clean shutdown, so just process until EOF
                 match Self::from_write_logs_loop_inner(&mut reader).await {
                     Ok((key, timestamp, data, checksum)) => {
-                        memtable
-                            .insert_inner(key, timestamp, data, false, &checksum)
-                            .await?
+                        match new_table
+                            .insert_inner(key, timestamp, data, true, &checksum)
+                            .await
+                        {
+                            Ok(_) | Err(Error::NewerDataAlreadyHere { .. }) => {}
+                            Err(e) => {
+                                tracing::error!(
+                                    "Could not insert recovered log line into memtable; err={e:?}"
+                                );
+                            }
+                        }
+                    }
+
+                    Err(Error::WriteLogEOF) => {
+                        // Expected EOF.
+                        break;
+                    }
+
+                    Err(Error::UnexpectedEOF { .. }) => {
+                        tracing::error!("Unexpected EOF in write log recovery {uuid}");
+                        break;
                     }
 
                     Err(e) => {
-                        if e.kind() == IoErrorKind::UnexpectedEof {
-                            break;
-                        }
+                        tracing::error!("Error in write log recovery {uuid}; err={e:?}");
                     }
                 }
             }
 
-            if !memtable.is_empty() {
-                let sstable = memtable
-                    .to_persistent_storage(write_log.parent().unwrap())
-                    .await?;
-
-                sstables.push(sstable);
-            } else {
-                tokio::fs::remove_file(write_log).await?;
-            }
+            let mv_target = write_log.with_extension("write_log_dropped");
+            tokio::fs::rename(write_log, mv_target).await?;
+            // tokio::fs::remove_file(write_log).await?;
         }
 
-        Ok(sstables)
+        Ok(new_table)
+    }
+
+    pub async fn dump_write_log_to_println(path: &Path) {
+        let file = tokio::fs::File::open(path).await.unwrap();
+        let mut reader = BufReader::new(file);
+
+        loop {
+            // could have stopped writing anywhere in a non-clean shutdown, so just process until EOF
+            match Self::from_write_logs_loop_inner(&mut reader).await {
+                Ok((key, timestamp, data, checksum)) => {
+                    let data = String::from_utf8_lossy(&data);
+                    println!("key={key} timestamp={timestamp:?} checksum={checksum:?}");
+                    println!("{data}");
+                }
+
+                Err(Error::WriteLogEOF) => {
+                    // Expected EOF.
+                    break;
+                }
+
+                Err(Error::UnexpectedEOF { .. }) => {
+                    tracing::error!("Unexpected EOF in write log recovery {path:?}");
+                    break;
+                }
+
+                Err(e) => {
+                    tracing::error!("Error in write log recovery {path:?}; err={e:?}");
+                }
+            }
+        }
     }
 
     async fn from_write_logs_loop_inner(
         reader: &mut BufReader<File>,
-    ) -> Result<(String, Duration, Bytes, Checksum), std::io::Error> {
+    ) -> Result<(String, Duration, Bytes, Checksum), Error> {
         // buf.write_u8(key.len() as u8).await.unwrap();
-        let keylen = reader.read_u8().await?;
+        let keylen = match reader.read_u8().await {
+            Ok(kl) => kl,
+            Err(e) => {
+                if e.kind() == IoErrorKind::UnexpectedEof {
+                    return Err(Error::WriteLogEOF);
+                } else {
+                    Err(e)?
+                }
+            }
+        };
         let mut key = BytesMut::zeroed(keylen as usize);
         // buf.write_all(key.as_bytes()).await.unwrap();
         reader.read_exact(&mut key).await?;
@@ -376,14 +429,12 @@ impl MemTable {
         let trailer = vec![reader.read_u8().await?, reader.read_u8().await?];
 
         if trailer != "\r\n".as_bytes() {
-            return Err(std::io::Error::new(
-                IoErrorKind::UnexpectedEof,
-                "Something is wrong with this file",
-            ));
+            return Err(Error::UnexpectedEOF { source: None });
         }
 
         let data: Bytes = data.into();
 
+        let key = String::from_utf8(key.to_vec()).map_err(|_| Error::InvalidKey)?;
         let checksum2 = md5sum(&data);
 
         if checksum2 != checksum {
@@ -391,10 +442,12 @@ impl MemTable {
             //     IoErrorKind::InvalidData,
             //     Error::InvalidChecksum,
             // ));
-            fixme(panic!("(FIXME: return an error for invalid checksum"));
+            return Err(Error::InvalidChecksum {
+                key,
+                table_path: "<write_log>".into(),
+            });
         }
 
-        let key = String::from_utf8(key.to_vec()).expect("FIXME");
         let entry = (key, Duration::new(secs, nanos), data, checksum);
         Ok(entry)
     }
@@ -438,7 +491,7 @@ impl<R: AsyncRead> AsyncRead for Md5BufReader<R> {
 }
 
 fn md5sum(data: impl AsRef<[u8]>) -> Checksum {
-    return fixme_msg([0; 16], "the real md5 makes things very very very slow");
+    // return fixme_msg([0; 16], "the real md5 makes things very very very slow");
     let mut hasher = Md5::new();
     hasher.update(data);
     let hash = hasher.finalize();
@@ -822,7 +875,10 @@ impl SSTable {
         let checksum2 = md5sum(data);
 
         if checksum != checksum2 {
-            return Err(Error::InvalidChecksum);
+            return Err(Error::InvalidChecksum {
+                key: key.to_string(),
+                table_path: self.inner.summary.path.to_string_lossy().into(),
+            });
         }
 
         // let mut ts_data = Bytes::copy_from_slice(data);
@@ -946,6 +1002,47 @@ pub struct KeySpace {
 
 pub fn timestamp() -> Duration {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
+}
+
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    use std::ops::Range;
+
+    use super::*;
+
+    pub(crate) fn make_key(i: usize) -> String {
+        format!("key_{i:0>6}")
+    }
+
+    /// Returns an sstable and a list of the keys/timestamps that were inserted into it.
+    pub(crate) async fn build_test_sstable(
+        generation: usize,
+        path: &Path,
+        range: Range<usize>,
+        timestamps: impl Iterator<Item = Duration>,
+    ) -> (SSTable, Vec<(String, Duration)>) {
+        let uuid = Uuid::new_with_generation(generation);
+        let table_writer = SSTableWriter::from_uuid(uuid);
+
+        let mut all_inserts = vec![];
+
+        let data_stream = range.zip(timestamps).map(|(index, timestamp)| {
+            let data = format!("data for key {index} {timestamp:?}");
+            let key = make_key(index);
+
+            println!("inserting {key} @ {timestamp:?}");
+            all_inserts.push((key.clone(), timestamp));
+            Ok((timestamp, key, data.as_bytes().to_vec()))
+        });
+
+        (
+            table_writer
+                .write_data(path, tokio_stream::iter(data_stream))
+                .await
+                .unwrap(),
+            all_inserts,
+        )
+    }
 }
 
 #[cfg(test)]
