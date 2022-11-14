@@ -22,7 +22,6 @@ path = "src/bin/dump_write_log.rs"
 tokio = { version = "*", features = ["full", "io-util"] }
 tokio-stream = "*"
 bytes = "^1.2.1"
-uuid = { version = "*", features = ["v4", "v7"] }
 rand = { version = "0.8" }
 serde = { version = "*", features = ["derive"] }
 bincode = "*"
