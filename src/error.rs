@@ -10,6 +10,7 @@ pub enum Error {
     Io { source: io::Error },
     OkShutdown,
     KeyNotInRange,
+    KeyNotInXorFilter,
     NoTablesInCompaction,
     MemTableClosed,
     SSTableAlreadyExists { path: PathBuf },

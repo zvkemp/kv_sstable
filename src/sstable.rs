@@ -1,31 +1,29 @@
 use std::{
-    collections::HashMap,
-    io::ErrorKind as IoErrorKind,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    pin::Pin,
-    str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::{Bytes, BytesMut};
-use md5::{Digest, Md5};
 use memmap2::Mmap;
-use pin_project_lite::pin_project;
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     sync::RwLock,
     time::Instant,
 };
 use tokio_stream::{Stream, StreamExt};
+use xorf::{Filter, Xor8};
 
 use crate::{
     error::Error,
     fixme, fixme_msg,
+    memtable::MemTable,
     sstable::index::{CompactionIndexInterleaver, DynIndexStream, IndexRows},
     table::KeyRange,
+    util::{md5sum, murmur2, Checksum, Uuid},
 };
 
 pub(crate) mod data;
@@ -33,12 +31,11 @@ pub(crate) mod index;
 
 pub(crate) static SSTABLE_EXT: &str = "sstable";
 pub(crate) static SUMMARY_EXT: &str = "summary";
+pub(crate) static WRITE_LOG: &str = "write_log";
 
 pub struct Topic {
     pub path: PathBuf,
 }
-
-pub type Checksum = [u8; 16];
 
 impl Topic {
     pub fn new(path: impl Into<PathBuf>) -> Self {
@@ -104,7 +101,7 @@ impl SSTable {
     }
 
     pub(crate) fn generation(&self) -> usize {
-        self.uuid().generation
+        self.uuid().generation()
     }
 
     pub(crate) fn key_range(&self) -> KeyRange {
@@ -160,313 +157,7 @@ impl SSTable {
     }
 }
 
-pub struct MemTable {
-    pub(crate) data: HashMap<String, (Duration, Bytes)>,
-    uuid: Uuid,
-    write_log: Option<File>,
-    // the size in-memory of the Bytes data only (does not include timestamps or keys)
-    // FIXME: should include keys?
-    memsize: usize,
-    pub(crate) last_insert_at: Instant,
-}
-
-impl MemTable {
-    // Just to allow mem::swap; this shouldn't be opened for writing.
-    pub(crate) fn new_for_shutdown() -> Self {
-        Self {
-            data: Default::default(),
-            uuid: Uuid::for_shutdown(),
-            write_log: None,
-            memsize: 0,
-            last_insert_at: Instant::now(),
-        }
-    }
-
-    pub(crate) async fn insert(
-        &mut self,
-        key: String,
-        timestamp: Duration,
-        data: Bytes,
-    ) -> Result<(), Error> {
-        let checksum = md5sum(&data);
-        self.insert_inner(key, timestamp, data, true, &checksum)
-            .await
-    }
-
-    async fn insert_inner(
-        &mut self,
-        key: String,
-        timestamp: Duration,
-        data: Bytes,
-        // this will be false if we are recovering a write log
-        write_to_log: bool,
-        checksum: &Checksum,
-    ) -> Result<(), Error> {
-        if let Some((prev_ts, prev_data)) = self.data.get(&key) {
-            match prev_ts.cmp(&timestamp) {
-                std::cmp::Ordering::Greater => {
-                    // keep the 'old' data because it has a newer timestamp
-                    // FIXME: do we need to write-log it?
-                    return Err(Error::NewerDataAlreadyHere);
-                }
-                std::cmp::Ordering::Equal => {
-                    if data == prev_data {
-                        fixme_msg(println!("data eq"), "why is this happening?");
-                        return Ok(());
-                    } else {
-                        return Err(Error::NewerDataAlreadyHere);
-                    }
-                }
-                std::cmp::Ordering::Less => {
-                    self.memsize -= prev_data.len();
-                }
-            }
-        }
-
-        if write_to_log {
-            self.write_log(&key, &timestamp, &data, checksum).await?;
-        }
-
-        self.memsize += data.len();
-        self.data.insert(key, (timestamp, data));
-        self.last_insert_at = Instant::now();
-
-        Ok(())
-    }
-
-    async fn write_log(
-        &mut self,
-        key: &str,
-        timestamp: &Duration,
-        data: &Bytes,
-        checksum: &Checksum,
-    ) -> Result<(), Error> {
-        fixme("should these be delimited somehow?");
-        // write-log format should be:
-        // key len (u8)
-        // key...
-        // timestamp_secs (u64)
-        // timestamp_nanos (u32)
-        // data len (u64)
-        // bytes
-        // \n\r? or some other terminator?
-        // self.write_log.
-        let write_log = self.write_log.as_mut().ok_or(Error::MemTableClosed)?;
-        let mut buf = BufWriter::new(&mut *write_log);
-
-        buf.write_u8(key.len() as u8).await.unwrap();
-        buf.write_all(key.as_bytes()).await.unwrap();
-        buf.write_u64(timestamp.as_secs()).await.unwrap();
-        buf.write_u32(timestamp.subsec_nanos()).await.unwrap();
-        buf.write_u64(data.len() as u64).await.unwrap();
-        buf.write_all(data.as_ref()).await.unwrap();
-        buf.write_all(checksum.as_slice()).await.unwrap();
-        buf.write_all("\r\n".as_bytes()).await.unwrap();
-        buf.flush().await.unwrap();
-
-        // write_log.sync_all().await.unwrap();
-
-        Ok(())
-    }
-
-    pub(crate) fn get(&self, key: &str) -> Option<&(Duration, Bytes)> {
-        self.data.get(key)
-    }
-
-    pub(crate) async fn new(path: Option<&Path>) -> Result<Self, Error> {
-        let uuid = Uuid::new_with_generation(0);
-
-        let write_log = match path {
-            Some(path) => {
-                let table_name = path.file_name().unwrap().to_str().unwrap();
-                let mut write_log_path = path.join(uuid.to_string());
-                write_log_path.set_extension("write_log");
-
-                let mut opts = tokio::fs::OpenOptions::new();
-                opts.append(true).create(true);
-                Some(opts.open(&write_log_path).await?)
-            }
-            None => None,
-        };
-
-        Ok(Self {
-            data: Default::default(),
-            uuid,
-            write_log,
-            memsize: 0,
-            last_insert_at: Instant::now(),
-        })
-    }
-
-    pub(crate) fn memsize(&self) -> usize {
-        self.memsize
-    }
-
-    pub(crate) async fn close_write_log(&mut self) -> Result<(), Error> {
-        if let Some(mut write_log) = self.write_log.take() {
-            write_log.flush().await.unwrap();
-            write_log.sync_all().await.unwrap();
-            drop(write_log);
-        }
-
-        Ok(())
-    }
-
-    pub(crate) async fn recover_write_logs(
-        path: &Path,
-        write_logs: Vec<PathBuf>,
-    ) -> Result<MemTable, Error> {
-        // This combines found write logs into a new log.
-        let mut new_table = MemTable::new(Some(path)).await?;
-
-        for write_log in write_logs {
-            let uuid = write_log.file_stem().unwrap().to_string_lossy();
-
-            let file = tokio::fs::File::open(&write_log).await?;
-            let mut reader = BufReader::new(file);
-
-            loop {
-                // could have stopped writing anywhere in a non-clean shutdown, so just process until EOF
-                match Self::from_write_logs_loop_inner(&mut reader).await {
-                    Ok((key, timestamp, data, checksum)) => {
-                        match new_table
-                            .insert_inner(key, timestamp, data, true, &checksum)
-                            .await
-                        {
-                            Ok(_) | Err(Error::NewerDataAlreadyHere { .. }) => {}
-                            Err(e) => {
-                                tracing::error!(
-                                    "Could not insert recovered log line into memtable; err={e:?}"
-                                );
-                            }
-                        }
-                    }
-
-                    Err(Error::WriteLogEOF) => {
-                        // Expected EOF.
-                        break;
-                    }
-
-                    Err(Error::UnexpectedEOF { .. }) => {
-                        tracing::error!("Unexpected EOF in write log recovery {uuid}");
-                        break;
-                    }
-
-                    Err(e) => {
-                        tracing::error!("Error in write log recovery {uuid}; err={e:?}");
-                    }
-                }
-            }
-
-            let mv_target = write_log.with_extension("write_log_dropped");
-            tokio::fs::rename(write_log, mv_target).await?;
-            // tokio::fs::remove_file(write_log).await?;
-        }
-
-        Ok(new_table)
-    }
-
-    pub async fn dump_write_log_to_println(path: &Path) {
-        let file = tokio::fs::File::open(path).await.unwrap();
-        let mut reader = BufReader::new(file);
-
-        loop {
-            // could have stopped writing anywhere in a non-clean shutdown, so just process until EOF
-            match Self::from_write_logs_loop_inner(&mut reader).await {
-                Ok((key, timestamp, data, checksum)) => {
-                    let data = String::from_utf8_lossy(&data);
-                    println!("key={key} timestamp={timestamp:?} checksum={checksum:?}");
-                    println!("{data}");
-                }
-
-                Err(Error::WriteLogEOF) => {
-                    // Expected EOF.
-                    break;
-                }
-
-                Err(Error::UnexpectedEOF { .. }) => {
-                    tracing::error!("Unexpected EOF in write log recovery {path:?}");
-                    break;
-                }
-
-                Err(e) => {
-                    tracing::error!("Error in write log recovery {path:?}; err={e:?}");
-                }
-            }
-        }
-    }
-
-    async fn from_write_logs_loop_inner(
-        reader: &mut BufReader<File>,
-    ) -> Result<(String, Duration, Bytes, Checksum), Error> {
-        // buf.write_u8(key.len() as u8).await.unwrap();
-        let keylen = match reader.read_u8().await {
-            Ok(kl) => kl,
-            Err(e) => {
-                if e.kind() == IoErrorKind::UnexpectedEof {
-                    return Err(Error::WriteLogEOF);
-                } else {
-                    Err(e)?
-                }
-            }
-        };
-        let mut key = BytesMut::zeroed(keylen as usize);
-        // buf.write_all(key.as_bytes()).await.unwrap();
-        reader.read_exact(&mut key).await?;
-        // buf.write_u64(timestamp.as_secs()).await.unwrap();
-        let secs = reader.read_u64().await?;
-        // buf.write_u32(timestamp.subsec_nanos()).await.unwrap();
-        let nanos = reader.read_u32().await?;
-        // buf.write_u64(data.len() as u64).await.unwrap();
-        let len = reader.read_u64().await?;
-        // buf.write_all(data.as_ref()).await.unwrap();
-        let mut data = BytesMut::zeroed(len as usize);
-        reader.read_exact(&mut data).await?;
-
-        let mut checksum = [0u8; 16];
-        reader.read_exact(&mut checksum).await?;
-
-        let trailer = vec![reader.read_u8().await?, reader.read_u8().await?];
-
-        if trailer != "\r\n".as_bytes() {
-            return Err(Error::UnexpectedEOF { source: None });
-        }
-
-        let data: Bytes = data.into();
-
-        let key = String::from_utf8(key.to_vec()).map_err(|_| Error::InvalidKey)?;
-        let checksum2 = md5sum(&data);
-
-        if checksum2 != checksum {
-            // return Err(std::io::Error::new(
-            //     IoErrorKind::InvalidData,
-            //     Error::InvalidChecksum,
-            // ));
-            return Err(Error::InvalidChecksum {
-                key,
-                table_path: "<write_log>".into(),
-            });
-        }
-
-        let entry = (key, Duration::new(secs, nanos), data, checksum);
-        Ok(entry)
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    pub(crate) async fn sync_write_log(&mut self) -> Result<(), Error> {
-        return Ok(()); // FIXME:
-        if let Some(write_log) = self.write_log.as_mut() {
-            write_log.flush().await.unwrap();
-            write_log.sync_all().await.unwrap();
-        }
-
-        Ok(())
-    }
-}
-
+#[cfg(fixme)]
 pin_project! {
     struct Md5BufReader<R> {
         #[pin]
@@ -475,6 +166,7 @@ pin_project! {
     }
 }
 
+#[cfg(fixme)]
 impl<R: AsyncRead> AsyncRead for Md5BufReader<R> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -488,14 +180,6 @@ impl<R: AsyncRead> AsyncRead for Md5BufReader<R> {
             std::task::Poll::Pending => todo!(),
         }
     }
-}
-
-fn md5sum(data: impl AsRef<[u8]>) -> Checksum {
-    // return fixme_msg([0; 16], "the real md5 makes things very very very slow");
-    let mut hasher = Md5::new();
-    hasher.update(data);
-    let hash = hasher.finalize();
-    hash.as_slice().try_into().unwrap()
 }
 
 impl SSTable {
@@ -576,26 +260,9 @@ impl SSTableInner {
     }
 }
 
-use rand::{
-    distributions::{Alphanumeric, Standard},
-    Rng,
-};
-
 use self::index::INDEX;
 
-pub fn rand_bytes(n: usize) -> Bytes {
-    rand::thread_rng().sample_iter(&Standard).take(n).collect()
-}
-
-pub fn rand_guid(n: usize) -> String {
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(n)
-        .map(char::from)
-        .collect()
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Summary {
     first_key: String,
     last_key: String,
@@ -604,79 +271,31 @@ pub struct Summary {
     key_count: usize,
     timestamp: Duration,
     path: PathBuf,
+    filter: Xor8,
+
     #[deprecated = "find a better way to interact and cache indexes"]
     #[serde(skip)]
     index: RwLock<Option<LoadedIndex>>,
 }
 
-struct SSTableWriter {
-    uuid: Uuid,
-}
-
-#[derive(Clone, Debug)]
-pub struct Uuid {
-    timestamp: Duration,
-    generation: usize,
-    guid: String,
-}
-
-impl Uuid {
-    pub fn new_with_generation(generation: usize) -> Self {
-        let timestamp = timestamp();
-        let guid = rand_guid(16);
-
-        Self {
-            timestamp,
-            generation,
-            guid,
-        }
-    }
-
-    fn for_shutdown() -> Uuid {
-        Self {
-            timestamp: Duration::from_secs(0),
-            generation: 0,
-            guid: "SHUTDOWN".to_owned(),
-        }
-    }
-}
-
-impl FromStr for Uuid {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        fn from_str_inner(s: &str) -> Option<Uuid> {
-            let mut segments = s.splitn(4, '-');
-
-            let secs: u64 = segments.next()?.parse().ok()?;
-            let nsecs: u32 = segments.next()?.parse().ok()?;
-            let generation: usize = segments.next()?.parse().ok()?;
-            let guid = segments.next()?.to_owned();
-
-            Some(Uuid {
-                timestamp: Duration::new(secs, nsecs),
-                generation,
-                guid,
-            })
-        }
-
-        from_str_inner(s).ok_or(Error::InvalidUuid {
-            input: s.to_owned(),
-        })
-    }
-}
-
-impl std::fmt::Display for Uuid {
+impl std::fmt::Debug for Summary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}-{:0>10}-{}-{}",
-            self.timestamp.as_secs(),
-            self.timestamp.subsec_nanos(),
-            self.generation,
-            self.guid
-        )
+        f.debug_struct("Summary")
+            .field("first_key", &self.first_key)
+            .field("last_key", &self.last_key)
+            .field("min_timestamp", &self.min_timestamp)
+            .field("max_timestamp", &self.max_timestamp)
+            .field("key_count", &self.key_count)
+            .field("timestamp", &self.timestamp)
+            .field("path", &self.path)
+            .field("filter", &"Xor8<...>")
+            .field("index", &self.index)
+            .finish()
     }
+}
+
+pub(crate) struct SSTableWriter {
+    uuid: Uuid,
 }
 
 impl SSTableWriter {
@@ -732,6 +351,7 @@ impl SSTableWriter {
         let mut min_timestamp = None;
         let mut max_timestamp = None;
         let mut key_count = 0;
+        let mut fingerprints = HashSet::new();
 
         while let Some(res) = sorted_data.next().await {
             let (timestamp, key, data) = res?;
@@ -756,6 +376,7 @@ impl SSTableWriter {
 
             key_count += 1;
 
+            // FIXME: necessary to re-sum values during a compaction? We probably also check during read
             let checksum = md5sum(&data);
 
             // #[cfg(fixme)]
@@ -771,6 +392,7 @@ impl SSTableWriter {
             )
             .await
             .unwrap();
+            fingerprints.insert(murmur2(key.as_bytes()) as u64);
         }
 
         index_file.flush().await.unwrap();
@@ -795,14 +417,16 @@ impl SSTableWriter {
                 .expect("should not have missing timestamps if a key was written"),
             key_count,
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
+            filter: Xor8::from(fingerprints.into_iter().collect::<Vec<_>>()),
             path: enclosing_directory.clone(),
             index: RwLock::new(None),
         };
 
         let serialized_summary = bincode::serialize(&summary).unwrap();
+        fixme("fixme - this unwrap has panicked; no such file or directory - perhaps if a compaction was in progress?");
         tokio::fs::write(&summary_path, serialized_summary)
             .await
-            .unwrap();
+            .expect(&format!("Panic on summary_path {:?}", summary_path));
 
         tokio::fs::rename(working_directory, &enclosing_directory).await?;
 
@@ -810,27 +434,6 @@ impl SSTableWriter {
         let _ = tokio::fs::remove_file(enclosing_directory.with_extension("write_log")).await;
 
         Ok(SSTable::from_dir(enclosing_directory.as_path()).await)
-    }
-}
-
-impl MemTable {
-    // FIXME: should path come from self?
-    pub(crate) async fn to_persistent_storage(&self, path: &Path) -> Result<SSTable, Error> {
-        let mut keys = self.data.keys().cloned().collect::<Vec<String>>();
-        keys.sort();
-
-        let table_writer = SSTableWriter::from_uuid(self.uuid.clone());
-
-        // This MemTable needs to remain available for live queries during this process,
-        // so there are a few things copied here. `bytes.clone()` should be efficient however.
-        let data_stream = keys.into_iter().map(|key| {
-            let (ts, bytes) = self.data.get(&key).unwrap();
-            Ok((*ts, key, bytes.clone()))
-        });
-
-        table_writer
-            .write_data(path, tokio_stream::iter(data_stream))
-            .await
     }
 }
 
@@ -859,6 +462,11 @@ impl SSTable {
             self.inner.summary.first_key,
             self.inner.summary.last_key
         );
+
+        let fingerprint = murmur2(key.as_bytes()) as u64;
+        if self.inner.summary.filter.contains(&fingerprint) {
+            return Err(Error::KeyNotInXorFilter);
+        }
 
         let (timestamp, position, len) =
             self.get_key(key).await.ok_or_else(|| Error::DataNotFound {
@@ -927,7 +535,7 @@ impl SSTable {
 
         let original_key_count: usize = tables.iter().map(|x| x.inner.summary.key_count).sum();
 
-        let mut interleaver = CompactionIndexInterleaver::new_from_streams(index_iterators);
+        let interleaver = CompactionIndexInterleaver::new_from_streams(index_iterators);
 
         let writer = SSTableWriter::from_generation(generation);
 
@@ -997,11 +605,6 @@ pub struct KeySpace {
     root: PathBuf, // e.g. [/unified_reports/:hour_timestamp/]
     shard_id: u16,
     memtable: MemTable,
-    // FIXME
-}
-
-pub fn timestamp() -> Duration {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
 }
 
 #[cfg(test)]
@@ -1048,6 +651,8 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use crate::util::{rand_bytes, timestamp};
 
     use super::*;
     use rand::distributions::Standard;

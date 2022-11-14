@@ -23,9 +23,10 @@ use tracing::{debug, info};
 use crate::{
     error::Error,
     fixme, fixme_msg,
+    memtable::MemTable,
     sstable::{
         index::{CompactionIndexInterleaver, DynIndexStream, IndexRow, IndexRows},
-        MemTable, SSTable,
+        SSTable,
     },
 };
 
@@ -316,9 +317,7 @@ impl Table {
         // todo!("FIXME");
 
         tracing::debug!("found write_logs: {:?}", write_logs);
-        println!("found write_logs: {:?}", write_logs);
         tracing::debug!("found sstables: {:?}", sstable_paths);
-        println!("found sstables: {:?}", sstable_paths);
 
         let mut recovered_memtable =
             MemTable::recover_write_logs(path.as_ref(), write_logs).await?;
@@ -599,12 +598,24 @@ impl Table {
                                     })
                                     .await;
 
+                                // should we just clone the reply_to Sender?
+                                fixme("remove this expect(); if the channel is closed we should just drop the stream");
                                 match rx.await {
                                     Ok(Ok((duration, bytes))) => {
-                                        reply_to
+                                        tracing::debug!(
+                                            "Event::StreamAll producing {}",
+                                            index_row.key
+                                        );
+                                        match reply_to
                                             .send(StreamData::Data(index_row.key, duration, bytes))
                                             .await
-                                            .expect("something wrong with the data stream channel");
+                                        {
+                                            Ok(_) => {}
+                                            Err(_) => {
+                                                tracing::error!("StreamData stream closed");
+                                                break;
+                                            }
+                                        }
                                     }
 
                                     Ok(Err(e)) => todo!("Error in table {e:?}"),
@@ -621,7 +632,9 @@ impl Table {
                     }
 
                     // If the stream ends without this terminator, then whoops. We probably had an error internally.
-                    reply_to.send(StreamData::Done).await.unwrap();
+                    // Ignore errors here; if the channel is closed, then they won't get this value anyway, and we're
+                    // exiting on the next line.
+                    let _ = reply_to.send(StreamData::Done).await;
 
                     drop(reply_to)
                 });
@@ -1013,8 +1026,6 @@ impl GenerationalSSTables {
         found: &mut Option<(Duration, Bytes)>,
     ) -> Result<(), Error> {
         // what assumptions can we make about generational residency?
-        fixme("add a bloom filter to the sstable summary");
-        fixme("https://github.com/ayazhafiz/xorf");
         for generation in self.inner.iter_mut() {
             if generation.covers_key(key)
                 && generation.covers_newer_timestamp(found.as_ref().map(|x| &x.0))
@@ -1024,7 +1035,9 @@ impl GenerationalSSTables {
                         Ok(res) => {
                             swap_compare(found, res);
                         }
-                        Err(Error::KeyNotInRange) | Err(Error::DataNotFound { .. }) => {}
+                        Err(Error::KeyNotInRange)
+                        | Err(Error::KeyNotInXorFilter)
+                        | Err(Error::DataNotFound { .. }) => {}
                         Err(e) => Err(e)?,
                     }
                 }

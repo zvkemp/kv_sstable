@@ -53,7 +53,7 @@ async fn test_table_with_compaction() {
         table_1_sender
             .send(Event::Put {
                 data: bytes,
-                timestamp: dwkv::sstable::timestamp(),
+                timestamp: dwkv::util::timestamp(),
                 key: key.clone(),
                 reply_to: tx,
             })
@@ -129,7 +129,7 @@ async fn test_table_with_compaction() {
                         .send(Event::Put {
                             key: key.clone(),
                             data: bytes.clone(),
-                            timestamp: dwkv::sstable::timestamp(),
+                            timestamp: dwkv::util::timestamp(),
                             reply_to: tx,
                         })
                         .await
