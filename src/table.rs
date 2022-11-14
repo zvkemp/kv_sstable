@@ -618,7 +618,9 @@ impl Table {
                                         }
                                     }
 
-                                    Ok(Err(e)) => todo!("Error in table {e:?}"),
+                                    Ok(Err(e)) => {
+                                        tracing::warn!("Error in stream: {:?}", e);
+                                    }
                                     Err(e) => {
                                         todo!(
                                             "RecvError waiting for response from table {e:?}; {:?}",
