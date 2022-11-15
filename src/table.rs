@@ -882,7 +882,7 @@ impl Table {
 
 // Just a vec of vecs, sstables sorted into their generation ids. Newer generations are lower.
 // FIXME: do we need to track timestamp/key ranges?
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct GenerationalSSTables {
     inner: Vec<Generation>,
 }
@@ -1123,11 +1123,9 @@ fn swap_compare(a: &mut Option<(Duration, Bytes)>, b: (Duration, Bytes)) {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, iter::successors, time::Duration};
-
-    use crate::sstable::{test_helpers::make_key, SSTable};
-
     use super::{GenerationalSSTables, Table};
+    use crate::sstable::{test_helpers::make_key, SSTable};
+    use std::{collections::HashMap, iter::successors, time::Duration};
 
     #[tokio::test]
     async fn test_table_1() {

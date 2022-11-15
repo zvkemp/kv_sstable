@@ -23,7 +23,7 @@ use crate::{
     memtable::MemTable,
     sstable::index::{CompactionIndexInterleaver, DynIndexStream, IndexRows},
     table::KeyRange,
-    util::{md5sum, murmur2, Checksum, Uuid},
+    util::{md5sum, murmur3, Checksum, Uuid},
 };
 
 pub(crate) mod data;
@@ -221,6 +221,7 @@ impl SSTable {
         sstable: &mut File,
         index_file: &mut File,
         offset: &mut usize,
+        index_offset: &mut usize,
     ) -> Result<(), Error> {
         let len = bytes.len();
 
@@ -228,11 +229,15 @@ impl SSTable {
 
         sstable.write_all_buf(&mut bytes).await.unwrap();
         sstable.write_all_buf(&mut checksum_slice).await.unwrap();
+        let mut serialized_index_row = index::serialize_row(key, ts, *offset, len);
+        let index_row_len = serialized_index_row.len();
+
         index_file
-            .write_all_buf(&mut index::serialize_row(key, ts, *offset, len))
+            .write_all_buf(&mut serialized_index_row)
             .await
             .unwrap();
 
+        *index_offset += index_row_len;
         *offset += len + 16;
 
         Ok(())
@@ -262,6 +267,12 @@ impl SSTableInner {
 
 use self::index::INDEX;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Sample {
+    key: String,
+    offset: usize,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Summary {
     first_key: String,
@@ -272,10 +283,11 @@ pub struct Summary {
     timestamp: Duration,
     path: PathBuf,
     filter: Xor8,
-
-    #[deprecated = "find a better way to interact and cache indexes"]
+    #[deprecated = "find a better way to interact with and cache indexes"]
     #[serde(skip)]
     index: RwLock<Option<LoadedIndex>>,
+    #[serde(default)]
+    samples: Vec<Sample>,
 }
 
 impl std::fmt::Debug for Summary {
@@ -289,6 +301,7 @@ impl std::fmt::Debug for Summary {
             .field("timestamp", &self.timestamp)
             .field("path", &self.path)
             .field("filter", &"Xor8<...>")
+            .field("samples", &self.samples)
             .field("index", &self.index)
             .finish()
     }
@@ -345,6 +358,7 @@ impl SSTableWriter {
         let mut index_file = options.open(&index_path).await.unwrap();
 
         let mut offset = 0usize;
+        let mut index_offset = 0usize;
 
         let mut first_key = None;
         let mut last_key = None;
@@ -352,6 +366,7 @@ impl SSTableWriter {
         let mut max_timestamp = None;
         let mut key_count = 0;
         let mut fingerprints = HashSet::new();
+        let mut samples = vec![];
 
         while let Some(res) = sorted_data.next().await {
             let (timestamp, key, data) = res?;
@@ -389,10 +404,20 @@ impl SSTableWriter {
                 &mut sstable_file,
                 &mut index_file,
                 &mut offset,
+                &mut index_offset,
             )
             .await
             .unwrap();
-            fingerprints.insert(murmur2(key.as_bytes()) as u64);
+
+            if key_count > 0 && key_count % 128 == 0 {
+                samples.push(Sample {
+                    key: key.clone(),
+                    offset: index_offset,
+                });
+            }
+
+            let f = murmur3(&mut key.as_bytes()) as u64;
+            fingerprints.insert(f);
         }
 
         index_file.flush().await.unwrap();
@@ -402,11 +427,12 @@ impl SSTableWriter {
             return Err(Error::NoDataWasWritten);
         };
 
-        fixme_msg("", "sample keys between first and last");
-
         let Some(last_key) = last_key else {
             return Err(Error::NoDataWasWritten);
         };
+
+        let fingerprints = fingerprints.into_iter().collect::<Vec<_>>();
+        let filter = Xor8::from(&fingerprints);
 
         let summary = Summary {
             first_key,
@@ -417,8 +443,9 @@ impl SSTableWriter {
                 .expect("should not have missing timestamps if a key was written"),
             key_count,
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
-            filter: Xor8::from(fingerprints.into_iter().collect::<Vec<_>>()),
+            filter,
             path: enclosing_directory.clone(),
+            samples,
             index: RwLock::new(None),
         };
 
@@ -463,8 +490,9 @@ impl SSTable {
             self.inner.summary.last_key
         );
 
-        let fingerprint = murmur2(key.as_bytes()) as u64;
-        if self.inner.summary.filter.contains(&fingerprint) {
+        let fingerprint = murmur3(&mut key.as_bytes()) as u64;
+
+        if !self.inner.summary.filter.contains(&fingerprint) {
             return Err(Error::KeyNotInXorFilter);
         }
 
@@ -473,7 +501,7 @@ impl SSTable {
                 key: key.to_owned(),
             })?;
 
-        let now = Instant::now();
+        // let now = Instant::now();
 
         let start = position as usize;
         let end = (position + len) as usize;
@@ -601,12 +629,6 @@ impl Summary {
 
 type LoadedIndex = HashMap<String, (Duration, u64, u64)>;
 
-pub struct KeySpace {
-    root: PathBuf, // e.g. [/unified_reports/:hour_timestamp/]
-    shard_id: u16,
-    memtable: MemTable,
-}
-
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use std::ops::Range;
@@ -633,7 +655,6 @@ pub(crate) mod test_helpers {
             let data = format!("data for key {index} {timestamp:?}");
             let key = make_key(index);
 
-            println!("inserting {key} @ {timestamp:?}");
             all_inserts.push((key.clone(), timestamp));
             Ok((timestamp, key, data.as_bytes().to_vec()))
         });
@@ -652,7 +673,7 @@ pub(crate) mod test_helpers {
 mod tests {
     use std::time::Duration;
 
-    use crate::util::{rand_bytes, timestamp};
+    use crate::util::{murmur2, rand_bytes, timestamp};
 
     use super::*;
     use rand::distributions::Standard;
@@ -732,5 +753,13 @@ mod tests {
     #[test]
     fn test_u32_bytes() {
         dbg!(1073741824u64.to_be_bytes());
+    }
+
+    #[test]
+    fn test_murmur() {
+        for i in 0..1 {
+            let key = format!("key_{i:0>6}");
+            dbg!(murmur2(key.as_bytes()));
+        }
     }
 }

@@ -337,6 +337,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(fixme_or_remove)]
     #[tokio::test]
     async fn test_this_index() {
         fixme("move this to a fixture");

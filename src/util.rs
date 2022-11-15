@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use md5::{Digest, Md5};
+use murmur3::murmur3_32;
 use rand::{
     distributions::{Alphanumeric, Standard},
     Rng,
@@ -8,6 +9,7 @@ use tokio_stream::Stream;
 
 use crate::{
     error::Error,
+    fixme,
     sstable::index::{CompactionIndexInterleaver, DynIndexStream, IndexRow, IndexRows},
 };
 use std::{
@@ -125,9 +127,16 @@ impl std::fmt::Display for Uuid {
     }
 }
 
-pub fn murmur2(data: &[u8]) -> u32 {
-    let length = data.len();
+pub fn murmur3<T: std::io::Read>(data: &mut T) -> u32 {
     let seed: u32 = 0x9747b28c;
+    murmur3_32(data, seed).unwrap()
+}
+
+#[deprecated = "use murmur3"]
+pub fn murmur2(data: &[u8]) -> i32 {
+    let length = data.len();
+    // let seed: i32 = 0x9747b28c;
+    let seed = dbg!(i32::from_be_bytes([0x97, 0x47, 0xb2, 0x8c]));
 
     // 'm' and 'r' are mixing constants generated offline.
     // They're not really 'magic', they just happen to work well.
@@ -135,40 +144,55 @@ pub fn murmur2(data: &[u8]) -> u32 {
     let r = 24;
 
     // Initialize the hash to a random value
-    let mut h: u32 = seed ^ length as u32;
+    let mut h: i32 = seed ^ length as i32;
     let length4 = length / 4;
 
     for i in 0..length4 {
         let i4 = i * 4;
-        let mut k: u32 = (data[i4] as u32 & 0xff)
-            + ((data[i4 + 1] as u32 & 0xff) << 8)
-            + ((data[i4 + 2] as u32 & 0xff) << 16)
-            + ((data[i4 + 3] as u32 & 0xff) << 24);
-        k = k.wrapping_mul(m);
-        k ^= k >> r;
-        k = k.wrapping_mul(m);
-        h = h.wrapping_mul(m);
+        let mut k: i32 = (data[i4] as i32 & 0xff)
+            + ((data[i4 + 1] as i32 & 0xff) << 8)
+            + ((data[i4 + 2] as i32 & 0xff) << 16)
+            + ((data[i4 + 3] as i32 & 0xff) << 24);
+
+        dbg!((k, m));
+        (k, _) = k.overflowing_mul(m);
+        dbg!(("new_k", k));
+
+        let k1 = {
+            let kb = dbg!(k.to_ne_bytes());
+            let ku = dbg!(u32::from_ne_bytes(kb));
+            i32::from_ne_bytes(dbg!((ku >> r).to_ne_bytes()))
+        };
+        k ^= k1;
+        dbg!(("shifted ", k));
+        (k, _) = k.overflowing_mul(m);
+        (h, _) = h.overflowing_mul(m);
+        println!("h={h} k={k}");
         h ^= k;
+        println!("h={h} k={k}\n");
     }
 
+    dbg!(h);
+
     // Handle the last few bytes of the input array
+    fixme("this part isn't correct");
     match length % 4 {
         3 => {
-            h ^= (data[(length & !3) + 2] as u32 & 0xff) << 16;
+            h ^= (data[(length & !3) + 2] as i32 & 0xff) << 16;
         }
         2 => {
-            h ^= (data[(length & !3) + 1] as u32 & 0xff) << 8;
+            h ^= (data[(length & !3) + 1] as i32 & 0xff) << 8;
         }
         1 => {
-            h ^= data[length & !3] as u32 & 0xff;
+            h ^= data[length & !3] as i32 & 0xff;
             h = h.wrapping_mul(m);
         }
         _ => {}
     }
 
     h ^= h >> 13;
-    h = h.wrapping_mul(m);
+    (h, _) = h.overflowing_mul(m);
     h ^= h >> 15;
 
-    h as u32
+    h as i32
 }
