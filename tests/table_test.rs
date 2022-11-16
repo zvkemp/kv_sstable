@@ -17,7 +17,7 @@ async fn test_table_with_compaction() {
         std::process::exit(1);
     }));
 
-    let mb = 2;
+    let kb = 16;
 
     let tempdir = TempDir::new("test_dwkv_table").unwrap();
     let table_path = tempdir.path().join("table_1_test");
@@ -26,7 +26,7 @@ async fn test_table_with_compaction() {
     let table_options = TableOptions {
         missing_table_behavior: dwkv::table::MissingTableBehavior::Create,
         writable: true,
-        memtable_size_limit: mb * 1024 * 1024,
+        memtable_size_limit: kb * 1024,
     };
     let table_1 = Table::new(&table_path, table_options).await.unwrap();
 
@@ -49,11 +49,13 @@ async fn test_table_with_compaction() {
     for key in all_keys.iter().take(limit) {
         let count = track_count(&key, &key_tracker).await;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let bytes: Bytes = data_for_key(&key, count);
+        let data: Bytes = data_for_key(&key, count);
+        let timestamp = dwkv::util::timestamp();
+        tracing::debug!("putting {key} @ {timestamp:?}, iteration = {count}");
         table_1_sender
             .send(Event::Put {
-                data: bytes,
-                timestamp: dwkv::util::timestamp(),
+                data,
+                timestamp,
                 key: key.clone(),
                 reply_to: tx,
             })
@@ -84,6 +86,7 @@ async fn test_table_with_compaction() {
 
     let compaction_sender_2 = table_2_sender.clone();
     let compaction_sender_3 = table_3_sender.clone();
+
     tokio::spawn(async move {
         loop {
             compaction_sender_2
@@ -103,7 +106,7 @@ async fn test_table_with_compaction() {
     let mut handles = vec![];
     for _ in 0..10 {
         let sender_2 = table_2_sender.clone();
-        let sender_3 = table_3_sender.clone();
+        // let sender_3 = table_3_sender.clone();
         let mut task_data = all_keys.split_off(share);
         std::mem::swap(&mut task_data, &mut all_keys);
 
@@ -119,17 +122,21 @@ async fn test_table_with_compaction() {
                     println!("{count}/{share}");
                 }
 
-                let count = track_count(&key, &tracker).await;
-                let bytes = data_for_key(&key, count);
+                let iteration = track_count(&key, &tracker).await;
+                let bytes = data_for_key(&key, iteration);
 
-                for sender in [&sender_2, &sender_3].iter() {
+                for sender in [&sender_2].iter() {
                     // dbg!(&count);
                     let (tx, rx) = oneshot::channel();
+                    let timestamp = dwkv::util::timestamp();
+
+                    tracing::debug!("putting {key} @ {timestamp:?}, iteration = {iteration}");
+
                     sender
                         .send(Event::Put {
                             key: key.clone(),
+                            timestamp,
                             data: bytes.clone(),
-                            timestamp: dwkv::util::timestamp(),
                             reply_to: tx,
                         })
                         .await
@@ -184,10 +191,10 @@ async fn get_data(table_2_sender: &Sender<Event>, key: &str) -> Bytes {
 }
 
 fn data_for_key(key: &str, count: usize) -> Bytes {
-    let data = format!("this is the data for {key}::{count}")
+    let data = format!("this is the data for {key}::{count} ")
         .as_bytes()
         .to_vec();
-    let multiplied = data.iter().cycle().take(16 * 1024);
+    let multiplied = data.iter().cycle().take(256);
     let bytes: Bytes = multiplied.copied().collect();
 
     bytes

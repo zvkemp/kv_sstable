@@ -151,14 +151,10 @@ impl CompactionIndexInterleaver {
 
         let tail = fetched.pop().unwrap();
 
-        fetched.retain(|(_, row)| {
-            if row.key == tail.1.key {
-                true
-            } else {
-                tracing::debug!(">>>> DROPPING DUPLICATE {row:?}");
-                false
-            }
-        });
+        tracing::debug!("fetched={fetched:?}\ntail={tail:?}");
+
+        // only compare identical keys; we are going to drop the older timestamps.
+        fetched.retain(|(_, row)| if row.key == tail.1.key { true } else { false });
 
         // drop the borrows
         let tail = tail.0;
@@ -166,7 +162,8 @@ impl CompactionIndexInterleaver {
 
         // discard the duplicates for this key
         for index in indexes {
-            this.states[index].pop_row();
+            let popped = this.states[index].pop_row();
+            tracing::debug!(">>>> DROPPING DUPLICATE {:?}", popped);
         }
 
         let index_row = this.states[tail].pop_row().unwrap();

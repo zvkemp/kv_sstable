@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
@@ -124,20 +125,20 @@ impl SSTable {
     pub(crate) async fn find_timestamp_greater_than(
         &mut self,
         key: &str,
-        timestamp: &Duration,
-    ) -> Option<Duration> {
+        search_ts: &Duration,
+    ) -> Result<Option<Duration>, Error> {
         // These conditionals should weed out almost everything
-        if self.max_timestamp() > timestamp {
+        if self.max_timestamp() > search_ts {
             if self.first_key() <= key && self.last_key() >= key {
-                if let Some((found_ts, _, _)) = self.get_key(key).await {
-                    if &found_ts >= timestamp {
-                        return Some(found_ts);
+                if let Some(IndexEntry { timestamp, .. }) = self.get_key(key).await? {
+                    if &timestamp >= search_ts {
+                        return Ok(Some(timestamp));
                     }
                 }
             }
         }
 
-        None
+        Ok(None)
     }
 
     pub(crate) fn max_timestamp(&self) -> &Duration {
@@ -409,6 +410,7 @@ impl SSTableWriter {
             .await
             .unwrap();
 
+            fixme("variable sample rate");
             if key_count > 0 && key_count % 128 == 0 {
                 samples.push(Sample {
                     key: key.clone(),
@@ -465,6 +467,7 @@ impl SSTableWriter {
 }
 
 impl SSTable {
+    #[cfg(feature = "loaded_index")]
     pub async fn get_key(&mut self, key: &str) -> Option<(Duration, u64, u64)> {
         fixme("where does this belong?");
 
@@ -478,6 +481,40 @@ impl SSTable {
 
         let idx_read = self.inner.summary.index.read().await;
         idx_read.as_ref().unwrap().get(key).map(ToOwned::to_owned)
+    }
+
+    #[cfg(not(feature = "loaded_index"))]
+    pub async fn get_key(&mut self, key: &str) -> Result<Option<IndexEntry>, Error> {
+        use std::borrow::Borrow;
+
+        use tokio::io::AsyncSeekExt;
+
+        let mut offset_lower = 0;
+        for sample in self.inner.summary.samples.iter() {
+            if sample.key.as_str() > key {
+                break;
+            } else {
+                offset_lower = sample.offset;
+            }
+        }
+
+        let mut reader = BufReader::new(self.inner.summary.read_index().await?);
+        reader
+            .seek(std::io::SeekFrom::Start(offset_lower as u64))
+            .await?;
+        // if offset_upper is none, there weren't enough keys to do a meaningful sample
+
+        while let Ok((idx_key, entry)) = read_index_entry(&mut reader).await {
+            match Borrow::<str>::borrow(&idx_key).cmp(key) {
+                std::cmp::Ordering::Equal => {
+                    return Ok(Some(entry));
+                }
+                std::cmp::Ordering::Greater => break,
+                _ => {}
+            }
+        }
+
+        Ok(None)
     }
 
     pub async fn get(&mut self, key: &str) -> Result<(Duration, Bytes), Error> {
@@ -496,8 +533,14 @@ impl SSTable {
             return Err(Error::KeyNotInXorFilter);
         }
 
-        let (timestamp, position, len) =
-            self.get_key(key).await.ok_or_else(|| Error::DataNotFound {
+        let IndexEntry {
+            timestamp,
+            position,
+            len,
+        } = self
+            .get_key(key)
+            .await?
+            .ok_or_else(|| Error::DataNotFound {
                 key: key.to_owned(),
             })?;
 
@@ -595,39 +638,56 @@ impl SSTable {
 impl Summary {
     #[deprecated = "not useful for large indexes - we don't want to load the whole thing into memory"]
     async fn load_index(&self) -> LoadedIndex {
-        let index_path = self.path.join(INDEX);
-        let index_f = tokio::fs::File::open(&index_path).await.unwrap();
+        let mut index = BufReader::new(self.read_index().await.unwrap());
+        let mut entries: HashMap<String, IndexEntry> = HashMap::new();
 
-        // this wrapper speeds things up by like 20x
-        let mut index = BufReader::new(index_f);
-
-        let mut entries: HashMap<String, (Duration, u64, u64)> = HashMap::new();
-
-        loop {
-            let keylen = match index.read_u8().await {
-                Ok(kl) => kl,
-                Err(_e) => break,
-            };
-            let mut key = BytesMut::zeroed(keylen as usize);
-            index.read_exact(&mut key).await.unwrap();
-            let secs = index.read_u64().await.unwrap();
-            let nanos = index.read_u32().await.unwrap();
-            let position = index.read_u64().await.unwrap();
-            let len = index.read_u64().await.unwrap();
-
-            let duration = Duration::new(secs, nanos);
-
-            entries.insert(
-                String::from_utf8(key.to_vec()).unwrap(),
-                (duration, position, len),
-            );
+        while let Ok((key, entry)) = read_index_entry(&mut index).await {
+            entries.insert(key.into(), entry);
         }
 
         entries
     }
+
+    async fn read_index(&self) -> Result<File, Error> {
+        let index_path = self.path.join(INDEX);
+        let file = tokio::fs::File::open(&index_path).await?;
+        // this wrapper speeds things up by like 20x
+        Ok(file)
+    }
 }
 
-type LoadedIndex = HashMap<String, (Duration, u64, u64)>;
+#[derive(Debug)]
+pub struct IndexEntry {
+    timestamp: Duration,
+    position: u64,
+    len: u64,
+}
+async fn read_index_entry<T: tokio::io::AsyncRead + Unpin>(
+    index: &mut BufReader<T>,
+) -> Result<(String, IndexEntry), Error> {
+    let keylen = match index.read_u8().await {
+        Ok(kl) => kl,
+        Err(_e) => Err(_e)?,
+    };
+    let mut key = BytesMut::zeroed(keylen as usize);
+    index.read_exact(&mut key).await.unwrap();
+    let secs = index.read_u64().await.unwrap();
+    let nanos = index.read_u32().await.unwrap();
+    let position = index.read_u64().await.unwrap();
+    let len = index.read_u64().await.unwrap();
+    let timestamp = Duration::new(secs, nanos);
+
+    Ok((
+        String::from_utf8_lossy(&key).into(),
+        IndexEntry {
+            timestamp,
+            position,
+            len,
+        },
+    ))
+}
+
+type LoadedIndex = HashMap<String, IndexEntry>;
 
 #[cfg(test)]
 pub(crate) mod test_helpers {

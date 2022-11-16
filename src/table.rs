@@ -12,7 +12,7 @@ use bytes::Bytes;
 use tokio::{
     sync::{
         mpsc::{Receiver, Sender},
-        oneshot, Semaphore,
+        oneshot, OwnedSemaphorePermit, Semaphore,
     },
     task::JoinHandle,
     time::Instant,
@@ -39,7 +39,7 @@ pub struct Table {
     sender: Option<Sender<Event>>,
     flush_semaphore: Arc<Semaphore>,
     is_shutting_down: bool,
-    flush_handle: Option<JoinHandle<Result<(), Error>>>,
+    flush_handle: Option<JoinHandle<Result<(SSTable, OwnedSemaphorePermit), Error>>>,
     compaction_task: Option<JoinHandle<Result<(), Error>>>,
     compaction_count: usize,
     writable: bool,
@@ -79,7 +79,7 @@ pub enum Event {
         timestamp: Duration,
         reply_to: EmptyReplyTo,
     },
-    MemTableFlushed(Result<SSTable, Error>),
+    MemTableFlushed,
     Tick, //
     Shutdown,
     ShutdownFinished,
@@ -151,7 +151,7 @@ impl Debug for Event {
                 .field("timestamp", timestamp)
                 .field("reply_to", reply_to)
                 .finish(),
-            Self::MemTableFlushed(arg0) => f.debug_tuple("MemTableFlushed").field(arg0).finish(),
+            Self::MemTableFlushed => f.debug_tuple("MemTableFlushed").finish(),
             Self::Tick => write!(f, "Tick"),
             Self::Shutdown => write!(f, "Shutdown"),
             Self::ShutdownFinished => write!(f, "ShutdownFinished"),
@@ -457,7 +457,28 @@ impl Table {
             return Ok(());
         }
 
+        match self.flush_handle.as_mut() {
+            Some(handle) => {
+                if handle.is_finished() || for_shutdown {
+                    self.finalize_flush().await;
+                } else {
+                    tracing::warn!("Flush task still active; can't flush again right now");
+                    return Ok(());
+                }
+            }
+
+            None => {}
+        }
+
+        if self.flush_semaphore.available_permits() < 1 {
+            tracing::warn!("No permits available for memtale flush");
+            return Ok(());
+        }
+
+        // FIXME: this can deadlock if we're not careful
+        // No amount of timeout will fix it.
         let permit = self.flush_semaphore.clone().acquire_owned().await.unwrap();
+
         tracing::warn!("flushing live_memtable");
         fixme("check previous state of flush_handle");
         // if self.previous_memtable.is_some() {
@@ -465,6 +486,10 @@ impl Table {
         //     todo!("memtables not flushing quickly enough; need backpressure on writes");
         //     todo!("two of these may come in quick succession if during shutdown");
         // }
+        // How is this possible
+        if self.previous_memtable.is_some() {
+            panic!("UH OH")
+        }
 
         let mut new_table = if self.is_shutting_down {
             MemTable::new_for_shutdown()
@@ -479,15 +504,19 @@ impl Table {
         self.previous_memtable = Some(prev_table.clone());
         let sender = self.sender.as_ref().unwrap().clone();
         let path = self.path.clone();
+
         let handle = tokio::spawn(async move {
             let result = prev_table.to_persistent_storage(&path).await;
-            sender.send(Event::MemTableFlushed(result)).await.unwrap();
-            drop(permit);
-            Ok(())
+            sender.send(Event::MemTableFlushed).await.unwrap();
+
+            fixme("is the permit still necessary?");
+            result.map(|sstable| (sstable, permit))
         });
 
         if for_shutdown {
-            return handle.await.unwrap();
+            let (sstable, permit) = handle.await.unwrap().unwrap();
+            drop(permit);
+            return Ok(());
         } else {
             self.flush_handle = Some(handle);
         }
@@ -509,15 +538,10 @@ impl Table {
                 reply_to,
             }) => self.handle_put(key, data, timestamp, reply_to).await,
 
-            Some(Event::MemTableFlushed(inner_res)) => match inner_res {
-                Ok(sstable) => {
-                    info!("MemTableFlushed; new_summary={}", sstable.uuid());
-                    self.sstables.push(sstable);
-                    self.previous_memtable = None;
-                    Ok(())
-                }
-                Err(e) => Err(e).unwrap(),
-            },
+            Some(Event::MemTableFlushed) => {
+                self.finalize_flush().await;
+                Ok(())
+            }
             Some(Event::Tick) => {
                 self.tick().await?;
                 Ok(())
@@ -744,12 +768,19 @@ impl Table {
 
         // Live memtable is likely to have the most recent data, but it won't always.
         let mut found = self.live_memtable.get(&key).cloned();
+        if found.is_some() {
+            debug!(
+                "found in live_memtable {key} @ {:?}",
+                found.as_ref().unwrap().0
+            );
+        }
         // Also check previous memtable
         if let Some(also_found) = self
             .previous_memtable
             .as_ref()
             .and_then(|prev| prev.get(&key).cloned())
         {
+            debug!("also found in previous_memtable {key} @ {:?}", also_found.0);
             swap_compare(&mut found, also_found);
         }
 
@@ -787,13 +818,20 @@ impl Table {
         tracing::debug!("TABLE::put[{key}@{timestamp:?}]");
         // FIXME: check if reply_to is opened, or if we timed out client-side
         let res = if !self.writable {
+            panic!("NOT WRITABLE");
             Err(Error::MemTableClosed)
         } else {
             if let Some(found_ts) = self.find_greater_timestamp_for_key(&key, &timestamp).await {
+                panic!("LATE ARRIVING");
                 tracing::warn!("Ignoring late-arriving key={key}@{timestamp:?}");
                 Ok(())
             } else {
-                self.live_memtable.insert(key, timestamp, data).await
+                self.live_memtable
+                    .insert(key, timestamp, data)
+                    .await
+                    .unwrap();
+
+                Ok(())
             }
         };
         // println!("sending reply");
@@ -875,6 +913,25 @@ impl Table {
         self.sstables
             .find_greater_timestamp_for_key(key, timestamp)
             .await
+    }
+
+    async fn finalize_flush(&mut self) {
+        if self.flush_handle.is_none() {
+            return;
+        }
+
+        let handle = self.flush_handle.take().unwrap();
+        match handle.await.unwrap() {
+            Ok((sstable, permit)) => {
+                self.previous_memtable = None;
+                self.sstables.push(sstable);
+                drop(permit);
+            }
+            Err(e) => {
+                tracing::error!("Error in flush task; err={e:?}");
+                Err::<(), _>(e).unwrap();
+            }
+        }
     }
 
     // pub fn get(&self)
@@ -1035,6 +1092,7 @@ impl GenerationalSSTables {
                 for sstable in generation.iter_mut() {
                     match sstable.get(key).await {
                         Ok(res) => {
+                            debug!("found in sstable {key} @ {:?}", res.0);
                             swap_compare(found, res);
                         }
                         Err(Error::KeyNotInRange)
@@ -1079,9 +1137,11 @@ impl GenerationalSSTables {
         // We only need to look in tables where the _max_ timestamp >= timestamp.
         for generation in self.inner.iter_mut() {
             for sstable in generation.iter_mut().rev() {
-                if let Some(res) = sstable.find_timestamp_greater_than(key, timestamp).await {
+                if let Ok(Some(res)) = sstable.find_timestamp_greater_than(key, timestamp).await {
                     return Some(res);
                 }
+
+                fixme("handle error?");
             }
         }
 
