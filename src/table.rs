@@ -37,9 +37,9 @@ pub struct Table {
     sstables: GenerationalSSTables,
     memtable_size_limit: usize,
     sender: Option<Sender<Event>>,
-    flush_semaphore: Arc<Semaphore>,
+    // flush_semaphore: Arc<Semaphore>,
     is_shutting_down: bool,
-    flush_handle: Option<JoinHandle<Result<(SSTable, OwnedSemaphorePermit), Error>>>,
+    flush_handle: Option<JoinHandle<Result<SSTable, Error>>>,
     compaction_task: Option<JoinHandle<Result<(), Error>>>,
     compaction_count: usize,
     writable: bool,
@@ -78,6 +78,8 @@ pub enum Event {
         // Or not - as long as the comparisons are consistent on all servers, LWW should work out?
         timestamp: Duration,
         reply_to: EmptyReplyTo,
+        #[deprecated]
+        guid: String,
     },
     MemTableFlushed,
     Tick, //
@@ -144,6 +146,7 @@ impl Debug for Event {
                 data,
                 timestamp,
                 reply_to,
+                ..
             } => f
                 .debug_struct("Put")
                 .field("key", key)
@@ -352,7 +355,7 @@ impl Table {
             sstables: generational_sstables,
             memtable_size_limit: options.memtable_size_limit,
             sender: None,
-            flush_semaphore: Arc::new(Semaphore::new(1)),
+            // flush_semaphore: Arc::new(Semaphore::new(1)),
             flush_handle: None,
             is_shutting_down: false,
             compaction_task: None,
@@ -470,14 +473,14 @@ impl Table {
             None => {}
         }
 
-        if self.flush_semaphore.available_permits() < 1 {
-            tracing::warn!("No permits available for memtale flush");
-            return Ok(());
-        }
+        // if self.flush_semaphore.available_permits() < 1 {
+        //     tracing::warn!("No permits available for memtale flush");
+        //     return Ok(());
+        // }
 
         // FIXME: this can deadlock if we're not careful
         // No amount of timeout will fix it.
-        let permit = self.flush_semaphore.clone().acquire_owned().await.unwrap();
+        // let permit = self.flush_semaphore.clone().acquire_owned().await.unwrap();
 
         tracing::warn!("flushing live_memtable");
         fixme("check previous state of flush_handle");
@@ -510,12 +513,11 @@ impl Table {
             sender.send(Event::MemTableFlushed).await.unwrap();
 
             fixme("is the permit still necessary?");
-            result.map(|sstable| (sstable, permit))
+            result.map(|sstable| sstable)
         });
 
         if for_shutdown {
-            let (sstable, permit) = handle.await.unwrap().unwrap();
-            drop(permit);
+            let (sstable) = handle.await.unwrap().unwrap();
             return Ok(());
         } else {
             self.flush_handle = Some(handle);
@@ -536,7 +538,8 @@ impl Table {
                 data,
                 timestamp,
                 reply_to,
-            }) => self.handle_put(key, data, timestamp, reply_to).await,
+                guid,
+            }) => self.handle_put(key, data, timestamp, reply_to, guid).await,
 
             Some(Event::MemTableFlushed) => {
                 self.finalize_flush().await;
@@ -718,10 +721,14 @@ impl Table {
         let handle = tokio::spawn(async move {
             let now = Instant::now();
             match SSTable::compact(&to_compact).await {
-                Ok(sstable) => sender
-                    .send(Event::CompactionFinished(sstable, to_compact))
-                    .await
-                    .unwrap(),
+                Ok(sstable) => {
+                    tracing::debug!("channel capacity at {}", sender.capacity());
+
+                    sender
+                        .send(Event::CompactionFinished(sstable, to_compact))
+                        .await
+                        .unwrap()
+                }
                 Err(e) => {
                     todo!()
                 }
@@ -814,27 +821,24 @@ impl Table {
         data: Bytes,
         timestamp: Duration,
         reply_to: EmptyReplyTo,
+        guid: String,
     ) -> Result<(), Error> {
-        tracing::debug!("TABLE::put[{key}@{timestamp:?}]");
+        tracing::debug!("[{guid} TABLE::put[{key}@{timestamp:?}]");
         // FIXME: check if reply_to is opened, or if we timed out client-side
         let res = if !self.writable {
-            panic!("NOT WRITABLE");
             Err(Error::MemTableClosed)
         } else {
             if let Some(found_ts) = self.find_greater_timestamp_for_key(&key, &timestamp).await {
-                panic!("LATE ARRIVING");
-                tracing::warn!("Ignoring late-arriving key={key}@{timestamp:?}");
+                tracing::warn!("[{guid}] Ignoring late-arriving key={key}@{timestamp:?}");
                 Ok(())
             } else {
-                self.live_memtable
-                    .insert(key, timestamp, data)
-                    .await
-                    .unwrap();
-
-                Ok(())
+                match self.live_memtable.insert(key, timestamp, data).await {
+                    Ok(_) | Err(Error::NewerDataAlreadyHere) => Ok(()),
+                    Err(e) => Err(e),
+                }
             }
         };
-        // println!("sending reply");
+        tracing::debug!("[{guid}] sending reply");
         let _ = reply_to.send(res);
 
         if self.should_flush() {
@@ -902,6 +906,7 @@ impl Table {
         key: &str,
         timestamp: &Duration,
     ) -> Option<Duration> {
+        // FIXME: why doesn't it look in the live memtable?
         if self.previous_memtable.is_some() {
             if let Some((found_ts, _)) = self.previous_memtable.as_ref().unwrap().get(key) {
                 if found_ts >= timestamp {
@@ -922,10 +927,9 @@ impl Table {
 
         let handle = self.flush_handle.take().unwrap();
         match handle.await.unwrap() {
-            Ok((sstable, permit)) => {
+            Ok(sstable) => {
                 self.previous_memtable = None;
                 self.sstables.push(sstable);
-                drop(permit);
             }
             Err(e) => {
                 tracing::error!("Error in flush task; err={e:?}");

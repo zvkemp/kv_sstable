@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use dwkv::error::Error;
 use dwkv::table::{Event, Table, TableOptions};
+use dwkv::util::rand_guid;
 use rand::seq::SliceRandom;
 use std::sync::Arc;
 use std::{collections::HashMap, time::Duration};
@@ -10,7 +11,8 @@ use tokio::sync::{oneshot, Mutex};
 
 #[tokio::test]
 async fn test_table_with_compaction() {
-    tracing_subscriber::fmt::init();
+    // tracing_subscriber::fmt::init();
+    console_subscriber::init();
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default_panic(info);
@@ -58,6 +60,7 @@ async fn test_table_with_compaction() {
                 timestamp,
                 key: key.clone(),
                 reply_to: tx,
+                guid: "None".into(),
             })
             .await
             .unwrap();
@@ -77,14 +80,17 @@ async fn test_table_with_compaction() {
     // Checks that if we start a new table at the same path, the data is parseable.
     // FIXME: also check that the write log works in case of a non-clean shutdown.
     let table_2 = Table::new(&table_path, table_options).await.unwrap();
+    #[cfg(disabled)]
     let table_3 = Table::new(&table_path.with_file_name("replica"), table_options)
         .await
         .unwrap();
 
     let (table_2_sender, table_2_handle) = table_2.spawn().unwrap();
+    #[cfg(disabled)]
     let (table_3_sender, table_3_handle) = table_3.spawn().unwrap();
 
     let compaction_sender_2 = table_2_sender.clone();
+    #[cfg(disabled)]
     let compaction_sender_3 = table_3_sender.clone();
 
     tokio::spawn(async move {
@@ -93,6 +99,7 @@ async fn test_table_with_compaction() {
                 .send(Event::Compact { threshold: 5 })
                 .await
                 .unwrap();
+            #[cfg(disabled)]
             compaction_sender_3
                 .send(Event::Compact { threshold: 5 })
                 .await
@@ -104,7 +111,7 @@ async fn test_table_with_compaction() {
     // should be 49000 keys left
     let share = all_keys.len() / 10;
     let mut handles = vec![];
-    for _ in 0..10 {
+    for i in 0..10 {
         let sender_2 = table_2_sender.clone();
         // let sender_3 = table_3_sender.clone();
         let mut task_data = all_keys.split_off(share);
@@ -114,23 +121,30 @@ async fn test_table_with_compaction() {
         let tracker = key_tracker.clone();
 
         handles.push(tokio::spawn(async move {
+            tracing::info!("[{i}] starting test task");
             let mut count = 0;
             while let Some(key) = task_data.pop() {
+                let guid = format!("{i}:{}", rand_guid(8));
                 count += 1;
 
                 if count % 100 == 0 {
                     println!("{count}/{share}");
                 }
 
+                tracing::info!("[{guid}] test_task 1");
                 let iteration = track_count(&key, &tracker).await;
                 let bytes = data_for_key(&key, iteration);
 
+                tracing::info!("[{guid}] test_task 2");
                 for sender in [&sender_2].iter() {
                     // dbg!(&count);
                     let (tx, rx) = oneshot::channel();
                     let timestamp = dwkv::util::timestamp();
 
-                    tracing::debug!("putting {key} @ {timestamp:?}, iteration = {iteration}");
+                    tracing::info!("[{guid}] test_task 2.1");
+                    tracing::debug!(
+                        "[{guid}] putting {key} @ {timestamp:?}, iteration = {iteration} sender_capacity = {}", sender.capacity()
+                    );
 
                     sender
                         .send(Event::Put {
@@ -138,22 +152,31 @@ async fn test_table_with_compaction() {
                             timestamp,
                             data: bytes.clone(),
                             reply_to: tx,
+                            guid: guid.clone(),
                         })
                         .await
                         .unwrap();
+                    tracing::info!("[{guid}] test_task 2.2");
                     if let Err(res) = rx.await.unwrap() {
                         tracing::error!("{res:?}");
                     }
+                    tracing::info!("[{guid}] test_task 2.3");
                 }
+                tracing::info!("[{guid}] test_task 3");
                 // tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            tracing::info!("[{i}] test_task 4");
         }));
     }
 
-    for handle in handles {
+    for (i, handle) in handles.into_iter().enumerate() {
+        tracing::info!("Awaiting handle {i}");
         handle.await.unwrap();
     }
 
+    panic!("1");
+
+    tracing::info!("Awaiting lock...");
     let lock = key_tracker.lock().await;
     for (key, count) in lock.iter() {
         let expected_data = data_for_key(&key, *count);

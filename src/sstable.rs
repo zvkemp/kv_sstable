@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
-    sync::RwLock,
+    // sync::RwLock,
     time::Instant,
 };
 use tokio_stream::{Stream, StreamExt};
@@ -284,9 +284,9 @@ pub struct Summary {
     timestamp: Duration,
     path: PathBuf,
     filter: Xor8,
-    #[deprecated = "find a better way to interact with and cache indexes"]
-    #[serde(skip)]
-    index: RwLock<Option<LoadedIndex>>,
+    // #[deprecated = "find a better way to interact with and cache indexes"]
+    // #[serde(skip)]
+    // index: RwLock<Option<LoadedIndex>>,
     #[serde(default)]
     samples: Vec<Sample>,
 }
@@ -303,7 +303,7 @@ impl std::fmt::Debug for Summary {
             .field("path", &self.path)
             .field("filter", &"Xor8<...>")
             .field("samples", &self.samples)
-            .field("index", &self.index)
+            // .field("index", &self.index)
             .finish()
     }
 }
@@ -439,23 +439,18 @@ impl SSTableWriter {
         let summary = Summary {
             first_key,
             last_key,
-            min_timestamp: min_timestamp
-                .expect("should not have missing timestamps if a key was written"),
-            max_timestamp: max_timestamp
-                .expect("should not have missing timestamps if a key was written"),
+            min_timestamp: min_timestamp.ok_or(Error::NoDataWasWritten)?,
+            max_timestamp: max_timestamp.ok_or(Error::NoDataWasWritten)?,
             key_count,
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
             filter,
             path: enclosing_directory.clone(),
             samples,
-            index: RwLock::new(None),
+            // index: RwLock::new(None),
         };
 
         let serialized_summary = bincode::serialize(&summary).unwrap();
-        fixme("fixme - this unwrap has panicked; no such file or directory - perhaps if a compaction was in progress?");
-        tokio::fs::write(&summary_path, serialized_summary)
-            .await
-            .expect(&format!("Panic on summary_path {:?}", summary_path));
+        tokio::fs::write(&summary_path, serialized_summary).await?;
 
         tokio::fs::rename(working_directory, &enclosing_directory).await?;
 
@@ -485,6 +480,7 @@ impl SSTable {
 
     #[cfg(not(feature = "loaded_index"))]
     pub async fn get_key(&mut self, key: &str) -> Result<Option<IndexEntry>, Error> {
+        let now = tokio::time::Instant::now();
         use std::borrow::Borrow;
 
         use tokio::io::AsyncSeekExt;
@@ -505,15 +501,20 @@ impl SSTable {
         // if offset_upper is none, there weren't enough keys to do a meaningful sample
 
         while let Ok((idx_key, entry)) = read_index_entry(&mut reader).await {
-            match Borrow::<str>::borrow(&idx_key).cmp(key) {
+            match idx_key.as_str().cmp(key) {
                 std::cmp::Ordering::Equal => {
+                    tracing::debug!("Found key in {:?}", now.elapsed());
                     return Ok(Some(entry));
                 }
-                std::cmp::Ordering::Greater => break,
+                std::cmp::Ordering::Greater => {
+                    // if we're alphabetically greater than the given key, it's not in this sorted index.
+                    break;
+                }
                 _ => {}
             }
         }
 
+        tracing::debug!("Found no key in {:?}", now.elapsed());
         Ok(None)
     }
 

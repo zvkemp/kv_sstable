@@ -32,6 +32,7 @@ pin-project-lite = "*"
 md-5 = "^0.10.0"
 xorf = { version = "*", features = ["serde"] }
 murmur3 = "*"
+console-subscriber = "*"
 
 [dev-dependencies]
 tempdir = { version = "*" }
