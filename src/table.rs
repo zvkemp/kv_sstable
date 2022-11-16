@@ -11,7 +11,7 @@ use std::{
 use bytes::Bytes;
 use tokio::{
     sync::{
-        mpsc::{Receiver, Sender},
+        mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender},
         oneshot, OwnedSemaphorePermit, Semaphore,
     },
     task::JoinHandle,
@@ -36,7 +36,9 @@ pub struct Table {
     previous_memtable: Option<Arc<MemTable>>,
     sstables: GenerationalSSTables,
     memtable_size_limit: usize,
-    sender: Option<Sender<Event>>,
+    // NOTE: Only use this in detached tasks, which you must not await in the main event loop.
+    client_sender: Option<Sender<Event>>,
+    internal_sender: Option<UnboundedSender<Event>>,
     // flush_semaphore: Arc<Semaphore>,
     is_shutting_down: bool,
     flush_handle: Option<JoinHandle<Result<SSTable, Error>>>,
@@ -78,11 +80,9 @@ pub enum Event {
         // Or not - as long as the comparisons are consistent on all servers, LWW should work out?
         timestamp: Duration,
         reply_to: EmptyReplyTo,
-        #[deprecated]
-        guid: String,
     },
     MemTableFlushed,
-    Tick, //
+    Tick(&'static str), //
     Shutdown,
     ShutdownFinished,
     // compact a specific generation
@@ -155,7 +155,7 @@ impl Debug for Event {
                 .field("reply_to", reply_to)
                 .finish(),
             Self::MemTableFlushed => f.debug_tuple("MemTableFlushed").finish(),
-            Self::Tick => write!(f, "Tick"),
+            Self::Tick(_) => write!(f, "Tick"),
             Self::Shutdown => write!(f, "Shutdown"),
             Self::ShutdownFinished => write!(f, "ShutdownFinished"),
             Self::CompactGen {
@@ -232,16 +232,24 @@ impl Default for TableOptions {
 
 impl Table {
     // each live table runs an event loop
-    async fn run(mut self, mut receiver: Receiver<Event>) -> Result<(), Error> {
+    async fn run(
+        mut self,
+        mut client_receiver: Receiver<Event>,
+        mut internal_receiver: UnboundedReceiver<Event>,
+    ) -> Result<(), Error> {
         fixme("listen for a shutdown");
         let mut ticker = tokio::time::interval(Duration::from_secs(10));
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    self.tick().await?;
+                    self.tick("select").await?;
                 }
 
-                event = receiver.recv() => {
+                event = client_receiver.recv() => {
+                    self.handle_event(event).await?
+                }
+
+                event = internal_receiver.recv() => {
                     self.handle_event(event).await?
                 }
             }
@@ -250,11 +258,15 @@ impl Table {
 
     pub fn spawn(mut self) -> Result<TableSpawn, Error> {
         // FIXME: should these channels just go in new?
-        let (sender, receiver) = tokio::sync::mpsc::channel(24);
-        self.sender = Some(sender.clone());
-        let handle = tokio::spawn(async move { self.run(receiver).await });
+        let (client_sender, client_receiver) = tokio::sync::mpsc::channel(24);
+        let (internal_sender, internal_receiver) = tokio::sync::mpsc::unbounded_channel();
 
-        Ok((sender, handle))
+        self.client_sender = Some(client_sender.clone());
+        self.internal_sender = Some(internal_sender);
+        let handle =
+            tokio::spawn(async move { self.run(client_receiver, internal_receiver).await });
+
+        Ok((client_sender, handle))
     }
 
     #[deprecated = "what is the reason for this?"]
@@ -354,7 +366,8 @@ impl Table {
             previous_memtable: None,
             sstables: generational_sstables,
             memtable_size_limit: options.memtable_size_limit,
-            sender: None,
+            client_sender: None,
+            internal_sender: None,
             // flush_semaphore: Arc::new(Semaphore::new(1)),
             flush_handle: None,
             is_shutting_down: false,
@@ -434,8 +447,8 @@ impl Table {
         }
     }
 
-    async fn tick(&mut self) -> Result<(), Error> {
-        tracing::trace!("tick!");
+    async fn tick(&mut self, src: &'static str) -> Result<(), Error> {
+        tracing::debug!("tick! {src}");
         if self.should_flush() {
             self.flush_live_memtable(false).await?;
         } else {
@@ -443,15 +456,12 @@ impl Table {
         }
 
         self.live_streams.retain(|t| !t.is_finished());
-        self.sender
-            .as_ref()
-            .unwrap()
-            .send(Event::Compact { threshold: 5 })
-            .await
-            .unwrap();
+
+        self.compact(5)?;
 
         fixme("clean up dangling indexes if streams is empty");
 
+        tracing::debug!("tick done {src}");
         Ok(())
     }
 
@@ -505,19 +515,19 @@ impl Table {
 
         let prev_table = Arc::new(new_table);
         self.previous_memtable = Some(prev_table.clone());
-        let sender = self.sender.as_ref().unwrap().clone();
+        let sender = self.internal_sender.clone().unwrap();
         let path = self.path.clone();
 
         let handle = tokio::spawn(async move {
             let result = prev_table.to_persistent_storage(&path).await;
-            sender.send(Event::MemTableFlushed).await.unwrap();
+            sender.send(Event::MemTableFlushed).unwrap();
 
             fixme("is the permit still necessary?");
             result.map(|sstable| sstable)
         });
 
         if for_shutdown {
-            let (sstable) = handle.await.unwrap().unwrap();
+            let _sstable = handle.await.unwrap().unwrap();
             return Ok(());
         } else {
             self.flush_handle = Some(handle);
@@ -531,6 +541,9 @@ impl Table {
         // Please send client-type errors back through the channel, or log them as needed.
         fixme("passing reply_to to the handlers is error prone; we should be allowed to `return` from those methods");
         fixme("without dropping the sender");
+
+        // NOTE: IMPORTANT: Do not attempt to send an event into self.client_sender from this task - only use it in detached tasks.
+        // Sending events into a full channel will deadlock.
         match event {
             Some(Event::Get { key, reply_to }) => self.handle_get(key, reply_to).await,
             Some(Event::Put {
@@ -538,22 +551,21 @@ impl Table {
                 data,
                 timestamp,
                 reply_to,
-                guid,
-            }) => self.handle_put(key, data, timestamp, reply_to, guid).await,
+            }) => self.handle_put(key, data, timestamp, reply_to).await,
 
             Some(Event::MemTableFlushed) => {
                 self.finalize_flush().await;
                 Ok(())
             }
-            Some(Event::Tick) => {
-                self.tick().await?;
+            Some(Event::Tick(src)) => {
+                self.tick(src).await?;
                 Ok(())
             }
             Some(Event::CompactGen {
                 generation,
                 threshold,
-            }) => self.compact_gen(generation, threshold).await,
-            Some(Event::Compact { threshold }) => self.compact(threshold).await,
+            }) => self.compact_gen(generation, threshold),
+            Some(Event::Compact { threshold }) => self.compact(threshold),
             Some(Event::CompactionFinished(new_sstable, old_sstables)) => {
                 tracing::info!("Compaction finished; new_sstable = {new_sstable:?}");
                 if let Err(e) = self.finalize_compaction(new_sstable, old_sstables).await {
@@ -564,11 +576,10 @@ impl Table {
             }
             Some(Event::Shutdown) => {
                 self.shutdown().await?;
-                self.sender
+                self.internal_sender
                     .as_ref()
                     .unwrap()
                     .send(Event::ShutdownFinished)
-                    .await
                     .unwrap();
 
                 Ok(())
@@ -577,12 +588,12 @@ impl Table {
                 tracing::warn!("DROPPING TABLE AT {:?}", self.path);
                 self.shutdown().await?;
                 self.drop_data().await?;
-                self.sender
-                    .as_ref()
-                    .unwrap()
-                    .send(Event::ShutdownFinished)
-                    .await
-                    .unwrap();
+
+                let sender = self.client_sender.clone();
+
+                tokio::spawn(async move {
+                    sender.unwrap().send(Event::ShutdownFinished).await.unwrap();
+                });
 
                 Ok(())
             }
@@ -611,7 +622,7 @@ impl Table {
                 // This should return the newest data for any particular key, but not necessary any keys that were new after the stream started.
                 // Run it a second time to get the newer keys!
                 let mut key_stream = self.list_keys(newer_than).await;
-                let sender = self.sender.clone().unwrap();
+                let sender = self.client_sender.clone().unwrap();
                 let self_debug = format!("{:?}", self);
                 let task = tokio::spawn(async move {
                     while let Some(index_row_res) = key_stream.next().await {
@@ -676,7 +687,7 @@ impl Table {
         }
     }
 
-    async fn compact(&mut self, threshold: usize) -> Result<(), Error> {
+    fn compact(&mut self, threshold: usize) -> Result<(), Error> {
         if let Some(candidate) = self
             .sstables
             .inner
@@ -685,13 +696,13 @@ impl Table {
             .find(|(_, v)| v.len() >= threshold)
             .map(|(i, _)| i)
         {
-            self.compact_gen(candidate, threshold).await
+            self.compact_gen(candidate, threshold)
         } else {
             Ok(())
         }
     }
 
-    async fn compact_gen(&mut self, gen: usize, threshold: usize) -> Result<(), Error> {
+    fn compact_gen(&mut self, gen: usize, threshold: usize) -> Result<(), Error> {
         if self.is_shutting_down {
             tracing::error!("can't compact during shutdown :(");
             return Ok(());
@@ -709,7 +720,7 @@ impl Table {
             return Ok(());
         }
 
-        let sender = self.sender.clone().unwrap();
+        let sender = self.internal_sender.clone().unwrap();
         let to_compact = self
             .sstables
             .get(gen)
@@ -721,14 +732,9 @@ impl Table {
         let handle = tokio::spawn(async move {
             let now = Instant::now();
             match SSTable::compact(&to_compact).await {
-                Ok(sstable) => {
-                    tracing::debug!("channel capacity at {}", sender.capacity());
-
-                    sender
-                        .send(Event::CompactionFinished(sstable, to_compact))
-                        .await
-                        .unwrap()
-                }
+                Ok(sstable) => sender
+                    .send(Event::CompactionFinished(sstable, to_compact))
+                    .unwrap(),
                 Err(e) => {
                     todo!()
                 }
@@ -751,6 +757,7 @@ impl Table {
         if let Some(task) = self.compaction_task.take() {
             tracing::warn!("awaiting live compaction...");
             // FIXME: clean up compaction
+            fixme("this may deadlock at shutdown, if the channel is full");
             task.await.unwrap().unwrap()
         }
 
@@ -821,15 +828,14 @@ impl Table {
         data: Bytes,
         timestamp: Duration,
         reply_to: EmptyReplyTo,
-        guid: String,
     ) -> Result<(), Error> {
-        tracing::debug!("[{guid} TABLE::put[{key}@{timestamp:?}]");
+        tracing::debug!("TABLE::put[{key}@{timestamp:?}]");
         // FIXME: check if reply_to is opened, or if we timed out client-side
         let res = if !self.writable {
             Err(Error::MemTableClosed)
         } else {
             if let Some(found_ts) = self.find_greater_timestamp_for_key(&key, &timestamp).await {
-                tracing::warn!("[{guid}] Ignoring late-arriving key={key}@{timestamp:?}");
+                tracing::warn!("Ignoring late-arriving key={key}@{timestamp:?}");
                 Ok(())
             } else {
                 match self.live_memtable.insert(key, timestamp, data).await {
@@ -838,15 +844,13 @@ impl Table {
                 }
             }
         };
-        tracing::debug!("[{guid}] sending reply");
         let _ = reply_to.send(res);
 
         if self.should_flush() {
-            self.sender
+            self.internal_sender
                 .as_ref()
                 .unwrap()
-                .send(Event::Tick)
-                .await
+                .send(Event::Tick("handle_put::should_flush"))
                 .unwrap();
         }
 
@@ -906,7 +910,12 @@ impl Table {
         key: &str,
         timestamp: &Duration,
     ) -> Option<Duration> {
-        // FIXME: why doesn't it look in the live memtable?
+        if let Some((found_ts, _)) = self.live_memtable.get(key) {
+            if found_ts >= timestamp {
+                return Some(*found_ts);
+            }
+        }
+
         if self.previous_memtable.is_some() {
             if let Some((found_ts, _)) = self.previous_memtable.as_ref().unwrap().get(key) {
                 if found_ts >= timestamp {
@@ -1096,7 +1105,7 @@ impl GenerationalSSTables {
                 for sstable in generation.iter_mut() {
                     match sstable.get(key).await {
                         Ok(res) => {
-                            debug!("found in sstable {key} @ {:?}", res.0);
+                            debug!("found in sstable {} {key} @ {:?}", sstable.uuid(), res.0);
                             swap_compare(found, res);
                         }
                         Err(Error::KeyNotInRange)
@@ -1152,7 +1161,7 @@ impl GenerationalSSTables {
         None
     }
 
-    #[deprecated = "probably not worth having, as we need to re-heck on the generations anyway"]
+    #[deprecated = "probably not worth having, as we need to re-check on the generations anyway"]
     fn covers_key(&self, key: &str) -> bool {
         self.inner
             .iter()

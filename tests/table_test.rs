@@ -11,8 +11,8 @@ use tokio::sync::{oneshot, Mutex};
 
 #[tokio::test]
 async fn test_table_with_compaction() {
-    // tracing_subscriber::fmt::init();
-    console_subscriber::init();
+    tracing_subscriber::fmt::init();
+
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default_panic(info);
@@ -93,6 +93,7 @@ async fn test_table_with_compaction() {
     #[cfg(disabled)]
     let compaction_sender_3 = table_3_sender.clone();
 
+    #[cfg(disabled)]
     tokio::spawn(async move {
         loop {
             compaction_sender_2
@@ -131,17 +132,13 @@ async fn test_table_with_compaction() {
                     println!("{count}/{share}");
                 }
 
-                tracing::info!("[{guid}] test_task 1");
                 let iteration = track_count(&key, &tracker).await;
                 let bytes = data_for_key(&key, iteration);
-
-                tracing::info!("[{guid}] test_task 2");
                 for sender in [&sender_2].iter() {
                     // dbg!(&count);
                     let (tx, rx) = oneshot::channel();
                     let timestamp = dwkv::util::timestamp();
 
-                    tracing::info!("[{guid}] test_task 2.1");
                     tracing::debug!(
                         "[{guid}] putting {key} @ {timestamp:?}, iteration = {iteration} sender_capacity = {}", sender.capacity()
                     );
@@ -156,16 +153,11 @@ async fn test_table_with_compaction() {
                         })
                         .await
                         .unwrap();
-                    tracing::info!("[{guid}] test_task 2.2");
                     if let Err(res) = rx.await.unwrap() {
                         tracing::error!("{res:?}");
                     }
-                    tracing::info!("[{guid}] test_task 2.3");
                 }
-                tracing::info!("[{guid}] test_task 3");
-                // tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tracing::info!("[{i}] test_task 4");
         }));
     }
 
@@ -174,9 +166,6 @@ async fn test_table_with_compaction() {
         handle.await.unwrap();
     }
 
-    panic!("1");
-
-    tracing::info!("Awaiting lock...");
     let lock = key_tracker.lock().await;
     for (key, count) in lock.iter() {
         let expected_data = data_for_key(&key, *count);

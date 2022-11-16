@@ -394,6 +394,7 @@ impl SSTableWriter {
 
             // FIXME: necessary to re-sum values during a compaction? We probably also check during read
             let checksum = md5sum(&data);
+            let index_offset_was = index_offset;
 
             // #[cfg(fixme)]
             // let (ts, bytes) = self.data.get(&key).unwrap();
@@ -414,7 +415,7 @@ impl SSTableWriter {
             if key_count > 0 && key_count % 128 == 0 {
                 samples.push(Sample {
                     key: key.clone(),
-                    offset: index_offset,
+                    offset: index_offset_was,
                 });
             }
 
@@ -481,16 +482,26 @@ impl SSTable {
     #[cfg(not(feature = "loaded_index"))]
     pub async fn get_key(&mut self, key: &str) -> Result<Option<IndexEntry>, Error> {
         let now = tokio::time::Instant::now();
-        use std::borrow::Borrow;
-
         use tokio::io::AsyncSeekExt;
 
         let mut offset_lower = 0;
+        #[deprecated]
+        let mut sample_key = "".to_string();
         for sample in self.inner.summary.samples.iter() {
             if sample.key.as_str() > key {
+                tracing::debug!(
+                    "searching samples for {key}: break (sample = {})",
+                    sample.key
+                );
                 break;
             } else {
+                tracing::debug!(
+                    "searching samples for {key}: setting offset_lower = {} (sample = {})",
+                    sample.offset,
+                    sample.key
+                );
                 offset_lower = sample.offset;
+                sample_key = sample.key.clone();
             }
         }
 
@@ -501,6 +512,9 @@ impl SSTable {
         // if offset_upper is none, there weren't enough keys to do a meaningful sample
 
         while let Ok((idx_key, entry)) = read_index_entry(&mut reader).await {
+            tracing::debug!(
+                "read_index_entry for {key} :: found idx_key={idx_key} (sample_key={sample_key} offset={offset_lower}"
+            );
             match idx_key.as_str().cmp(key) {
                 std::cmp::Ordering::Equal => {
                     tracing::debug!("Found key in {:?}", now.elapsed());
@@ -574,7 +588,7 @@ impl SSTable {
         Ok((timestamp, Bytes::copy_from_slice(data)))
     }
 
-    pub(crate) async fn compact(tables: &[SSTable]) -> Result<SSTable, Error> {
+    pub(crate) async fn compact(tables: &Vec<SSTable>) -> Result<SSTable, Error> {
         // FIXME: can we run some sort of progress marker to avoid duplicating long-running work, if the process has to restart?
         // Or is it good enough to just seek the source files to after the last complete entry in the compacted index?
         // For now, assume we just need to restart

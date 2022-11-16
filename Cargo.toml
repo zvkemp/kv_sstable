@@ -8,9 +8,9 @@ edition = "2021"
 name = "dwkv"
 path = "src/lib.rs"
 
-[[bin]]
-name = "dwkv-cli"
-path = "src/bin/cli.rs"
+# [[bin]]
+# name = "dwkv-cli"
+# path = "src/bin/cli.rs"
 
 [[bin]]
 name = "dump_write_log"
@@ -27,12 +27,11 @@ serde = { version = "*", features = ["derive"] }
 bincode = "*"
 memmap2 = "*"
 tracing = "*"
-tracing-subscriber = "*"
 pin-project-lite = "*"
 md-5 = "^0.10.0"
 xorf = { version = "*", features = ["serde"] }
 murmur3 = "*"
-console-subscriber = "*"
+tracing-subscriber = "*"
 
 [dev-dependencies]
 tempdir = { version = "*" }
