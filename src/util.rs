@@ -13,14 +13,14 @@ use crate::{
     sstable::index::{CompactionIndexInterleaver, DynIndexStream, IndexRow, IndexRows},
 };
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub async fn list_keys_in_indexes(
-    index_paths: impl Iterator<Item = &Path>,
+    index_paths: impl Iterator<Item = PathBuf>,
 ) -> Pin<Box<dyn Stream<Item = Result<(usize, IndexRow), Error>>>> {
     let mut streams = vec![];
 
