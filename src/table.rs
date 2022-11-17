@@ -1,5 +1,4 @@
 use std::{
-    cmp::Ordering,
     fmt::Debug,
     path::{Path, PathBuf},
     pin::Pin,
@@ -12,13 +11,13 @@ use bytes::Bytes;
 use tokio::{
     sync::{
         mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender},
-        oneshot, OwnedSemaphorePermit, Semaphore,
+        oneshot,
     },
     task::JoinHandle,
     time::Instant,
 };
 use tokio_stream::{Stream, StreamExt};
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::{
     error::Error,
@@ -46,6 +45,7 @@ pub struct Table {
     compaction_count: usize,
     writable: bool,
     live_streams: Vec<JoinHandle<()>>,
+    autocompact: bool,
 }
 
 impl std::fmt::Debug for Table {
@@ -85,11 +85,6 @@ pub enum Event {
     Tick(&'static str), //
     Shutdown,
     ShutdownFinished,
-    // compact a specific generation
-    CompactGen {
-        generation: usize,
-        threshold: usize,
-    },
     // compact the newest generation that meets the threshold.
     // NOTE: compacting older generations is unlikely to have a great effect in reclaimed space,
     // as most updates should be in the newer gens.
@@ -158,14 +153,6 @@ impl Debug for Event {
             Self::Tick(_) => write!(f, "Tick"),
             Self::Shutdown => write!(f, "Shutdown"),
             Self::ShutdownFinished => write!(f, "ShutdownFinished"),
-            Self::CompactGen {
-                generation,
-                threshold,
-            } => f
-                .debug_struct("CompactGen")
-                .field("generation", generation)
-                .field("threshold", threshold)
-                .finish(),
             Self::Compact { threshold } => f
                 .debug_struct("Compact")
                 .field("threshold", threshold)
@@ -218,6 +205,7 @@ pub struct TableOptions {
     pub missing_table_behavior: MissingTableBehavior,
     pub writable: bool,
     pub memtable_size_limit: usize,
+    pub autocompact: bool,
 }
 
 impl Default for TableOptions {
@@ -226,6 +214,7 @@ impl Default for TableOptions {
             missing_table_behavior: MissingTableBehavior::Create,
             writable: true,
             memtable_size_limit: 8 * 1024 * 1024,
+            autocompact: true,
         }
     }
 }
@@ -284,6 +273,7 @@ impl Table {
                 missing_table_behavior: MissingTableBehavior::Error,
                 writable: false,
                 memtable_size_limit: 0,
+                autocompact: false,
             },
         )
         .await
@@ -375,6 +365,7 @@ impl Table {
             compaction_count: 0,
             writable: options.writable,
             live_streams: vec![],
+            autocompact: options.autocompact,
         })
     }
 
@@ -448,7 +439,7 @@ impl Table {
     }
 
     async fn tick(&mut self, src: &'static str) -> Result<(), Error> {
-        tracing::debug!("tick! {src}");
+        tracing::trace!("tick! {src}");
         if self.should_flush() {
             self.flush_live_memtable(false).await?;
         } else {
@@ -457,11 +448,13 @@ impl Table {
 
         self.live_streams.retain(|t| !t.is_finished());
 
-        self.compact(5)?;
+        if self.autocompact {
+            self.compact(5)?;
+        }
 
         fixme("clean up dangling indexes if streams is empty");
 
-        tracing::debug!("tick done {src}");
+        tracing::trace!("tick done {src}");
         Ok(())
     }
 
@@ -561,10 +554,6 @@ impl Table {
                 self.tick(src).await?;
                 Ok(())
             }
-            Some(Event::CompactGen {
-                generation,
-                threshold,
-            }) => self.compact_gen(generation, threshold),
             Some(Event::Compact { threshold }) => self.compact(threshold),
             Some(Event::CompactionFinished(new_sstable, old_sstables)) => {
                 tracing::info!("Compaction finished; new_sstable = {new_sstable:?}");
@@ -1208,6 +1197,7 @@ mod tests {
                 missing_table_behavior: super::MissingTableBehavior::Create,
                 writable: true,
                 memtable_size_limit: 1000,
+                autocompact: true,
             },
         );
     }

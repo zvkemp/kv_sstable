@@ -29,6 +29,7 @@ async fn test_table_with_compaction() {
         missing_table_behavior: dwkv::table::MissingTableBehavior::Create,
         writable: true,
         memtable_size_limit: kb * 1024,
+        autocompact: true,
     };
     let table_1 = Table::new(&table_path, table_options).await.unwrap();
 
@@ -60,7 +61,6 @@ async fn test_table_with_compaction() {
                 timestamp,
                 key: key.clone(),
                 reply_to: tx,
-                guid: "None".into(),
             })
             .await
             .unwrap();
@@ -93,7 +93,6 @@ async fn test_table_with_compaction() {
     #[cfg(disabled)]
     let compaction_sender_3 = table_3_sender.clone();
 
-    #[cfg(disabled)]
     tokio::spawn(async move {
         loop {
             compaction_sender_2
@@ -149,7 +148,6 @@ async fn test_table_with_compaction() {
                             timestamp,
                             data: bytes.clone(),
                             reply_to: tx,
-                            guid: guid.clone(),
                         })
                         .await
                         .unwrap();
