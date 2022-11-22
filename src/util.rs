@@ -175,7 +175,7 @@ pub fn murmur2(data: &[u8]) -> i32 {
     dbg!(h);
 
     // Handle the last few bytes of the input array
-    fixme("this part isn't correct");
+    todo!("this part isn't correct");
     match length % 4 {
         3 => {
             h ^= (data[(length & !3) + 2] as i32 & 0xff) << 16;

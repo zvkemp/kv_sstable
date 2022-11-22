@@ -748,7 +748,8 @@ pub(crate) mod test_helpers {
 mod tests {
     use std::time::Duration;
 
-    use crate::util::{murmur2, rand_bytes, timestamp};
+    use crate::util::{murmur2 as flawed_murmur2, rand_bytes, timestamp};
+    use murmur2::{murmur2, KAFKA_SEED};
 
     use super::*;
     use rand::distributions::Standard;
@@ -832,9 +833,15 @@ mod tests {
 
     #[test]
     fn test_murmur() {
-        for i in 0..1 {
+        for i in 0..100 {
             let key = format!("key_{i:0>6}");
-            dbg!(murmur2(key.as_bytes()));
+            let mm = murmur2(key.as_bytes(), KAFKA_SEED);
+            let bytes = mm.to_ne_bytes();
+            let mmi32 = i32::from_ne_bytes(bytes);
+            let m = mmi32 % 32;
+
+            // dbg!((key, mm, mmi32, mmi32 % 32));
+            println!("{key} h={mmi32} m={m}\n");
         }
     }
 }
